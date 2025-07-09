@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>KeniBox SS Tool</title>
+    <link rel="stylesheet" href="styles.css">
+    <meta http-equiv="Content-Security-Policy" content="script-src 'self';">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="assets/logo.png" class="logo" alt="KeniBox Logo">
+            <h1>KeniBox SS Tool</h1>
+            <div class="controls">
+                <button id="exportResultsBtn" class="btn secondary">Exportar Resultados</button>
+                <span id="browserInfo" class="browser-info"></span>
+            </div>
+        </div>
+        
+        <div class="card-container">
+            <div class="card">
+                <h2>Archivos JAR</h2>
+                <p>Encuentra todos los archivos JAR en tu PC</p>
+                <button id="findJarBtn" class="btn">Buscar JAR</button>
+                <div id="jarList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Cambios de Extensión</h2>
+                <p>Detectar cambios sospechosos de extensión</p>
+                <button id="checkExtensionsBtn" class="btn">Verificar Extensiones</button>
+                <div id="extensionsList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Archivos Eliminados</h2>
+                <p>Archivos eliminados recientemente</p>
+                <div class="btn-group">
+                    <button id="deletedFiles30Btn" class="btn small">30 min</button>
+                    <button id="deletedFiles60Btn" class="btn small active">60 min</button>
+                    <button id="deletedFiles120Btn" class="btn small">120 min</button>
+                </div>
+                <div id="deletedList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>JARs Ejecutados</h2>
+                <p>Archivos JAR ejecutados recientemente</p>
+                <div class="btn-group">
+                    <button id="executedJars1Btn" class="btn small">1 hora</button>
+                    <button id="executedJars4Btn" class="btn small active">4 horas</button>
+                    <button id="executedJars24Btn" class="btn small">24 horas</button>
+                </div>
+                <div id="executedList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Estado USB</h2>
+                <p>Verificar si un USB fue desconectado antes de la SS</p>
+                <button id="usbStatusBtn" class="btn">Verificar USB</button>
+                <div id="usbStatus" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Grabación de Pantalla</h2>
+                <p>Detecta si hay aplicaciones grabando la pantalla</p>
+                <button id="screenRecordingBtn" class="btn">Verificar Grabación</button>
+                <div id="recordingStatus" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Historial de Navegación</h2>
+                <p>Accede al historial del navegador</p>
+                <button id="browserHistoryBtn" class="btn">Abrir Historial</button>
+                <div id="historyStatus" class="result-area">
+                    <div class="placeholder">El historial se abrirá en el navegador</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Cheats de Minecraft</h2>
+                <p>Detecta visitas a sitios de cheats y lista de hacks</p>
+                <button id="minecraftCheatsBtn" class="btn">Buscar Cheats</button>
+                <div id="cheatsList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Servicios Detenidos</h2>
+                <p>Detecta servicios relacionados detenidos</p>
+                <button id="stoppedServicesBtn" class="btn">Verificar Servicios</button>
+                <div id="servicesList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Historial de Carpetas</h2>
+                <p>Muestra carpetas visitadas recientemente</p>
+                <button id="folderHistoryBtn" class="btn">Ver Historial</button>
+                <div id="folderList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Historial de Ejecuciones</h2>
+                <p>Historial completo de programas ejecutados</p>
+                <div class="btn-group">
+                    <button id="executionHistory1Btn" class="btn small">1 hora</button>
+                    <button id="executionHistory4Btn" class="btn small active">4 horas</button>
+                    <button id="executionHistory12Btn" class="btn small">12 horas</button>
+                </div>
+                <div id="executionList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Historial de Comandos</h2>
+                <p>Historial de comandos CMD y PowerShell</p>
+                <button id="commandHistoryBtn" class="btn">Ver Comandos</button>
+                <div id="commandHistoryList" class="result-area">
+                    <div class="placeholder">Los resultados aparecerán aquí</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Archivos de Minecraft</h2>
+                <p>Abre y analiza los archivos de Minecraft</p>
+                <button id="minecraftFilesBtn" class="btn">Abrir Archivos</button>
+                <div id="minecraftFilesList" class="result-area">
+                    <div class="placeholder">Los archivos se abrirán en el explorador</div>
+                </div>
+            </div>
+        </div>
+        
+        <footer>
+            <p>KeniBox SS Tool © 2025 | Desarrollado para Minecraft | v1.1.0</p>
+        </footer>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>
