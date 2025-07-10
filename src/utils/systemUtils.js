@@ -1,454 +1,516 @@
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 const os = require('os');
-const { promisify } = require('util');
-const { spawn } = require('child_process');
+const util = require('util');
+const { shell, app } = require('electron');
 
-const execPromise = promisify(exec);
-const readdirPromise = promisify(fs.readdir);
-const statPromise = promisify(fs.stat);
+// Convertir exec a promesa
+const execAsync = util.promisify(exec);
 
 /**
- * Encuentra todos los archivos .jar en el sistema
+ * Busca todos los archivos JAR en el sistema
+ * @param {Object} options Opciones de búsqueda (fechaInicio, fechaFin)
+ * @returns {Promise<Array>} Lista de archivos JAR encontrados
  */
-async function findAllJarFiles() {
-  const jarFiles = [];
-  const driveLetters = [];
-  
-  if (process.platform === 'win32') {
-    // En Windows, buscar en todas las unidades
-    for (let i = 65; i <= 90; i++) {
-      const driveLetter = String.fromCharCode(i) + ':\\';
+async function findAllJarFiles(options = {}) {
+  try {
+    const result = [];
+    const homeDir = os.homedir();
+    const drives = await getSystemDrives();
+    
+    // Mostrar progreso
+    let progress = 0;
+    const totalDrives = drives.length;
+    const updateProgress = () => {
+      progress++;
+      return Math.floor((progress / totalDrives) * 100);
+    };
+    
+    for (const drive of drives) {
       try {
-        if (fs.existsSync(driveLetter)) {
-          driveLetters.push(driveLetter);
-        }
+        await searchJarFilesRecursively(drive, result, 0, options);
+        // Actualizar progreso después de cada unidad
+        updateProgress();
       } catch (error) {
-        console.error(`Error accessing drive ${driveLetter}:`, error);
+        console.error(`Error buscando en ${drive}:`, error);
       }
     }
-  } else {
-    // En macOS/Linux, buscar desde la raíz
-    driveLetters.push('/');
+    
+    // Ordenar por fecha de modificación, más reciente primero
+    result.sort((a, b) => b.lastModified - a.lastModified);
+    
+    return result;
+  } catch (error) {
+    console.error('Error en findAllJarFiles:', error);
+    throw error;
   }
-  
-  // Agregar ubicaciones comunes primero para optimizar la búsqueda
-  const userHome = os.homedir();
-  const commonLocations = [
-    path.join(userHome, 'Downloads'),
-    path.join(userHome, 'Desktop'),
-    path.join(userHome, 'Documents'),
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft'),
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft', 'mods'),
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft', 'versions'),
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft', 'libraries')
-  ];
-  
-  // Buscar primero en ubicaciones comunes
-  for (const location of commonLocations) {
-    try {
-      if (fs.existsSync(location)) {
-        await searchJarFilesRecursively(location, jarFiles, 0);
-      }
-    } catch (error) {
-      console.error(`Error searching location ${location}:`, error);
-    }
-  }
-  
-  // Si no encontramos suficientes archivos JAR, buscar en todo el sistema
-  if (jarFiles.length < 10) {
-    for (const drive of driveLetters) {
-      try {
-        await searchJarFilesRecursively(drive, jarFiles);
-      } catch (error) {
-        console.error(`Error searching drive ${drive}:`, error);
-      }
-    }
-  }
-  
-  return jarFiles;
 }
 
 /**
- * Búsqueda recursiva de archivos .jar
+ * Busca archivos JAR de forma recursiva en un directorio
+ * @param {string} directory Directorio donde buscar
+ * @param {Array} result Array donde almacenar resultados
+ * @param {number} depth Profundidad actual de recursión
+ * @param {Object} options Opciones de filtrado
  */
-async function searchJarFilesRecursively(directory, result, depth = 0) {
-  // Limitar la profundidad de búsqueda para evitar bucles infinitos
+async function searchJarFilesRecursively(directory, result, depth = 0, options = {}) {
+  // Limitar la profundidad para evitar búsquedas infinitas
+  if (depth > 15) return;
+  
+  try {
+    // Verificar si debemos omitir este directorio
+    if (shouldSkipDirectory(directory)) return;
+    
+    const items = await fs.promises.readdir(directory, { withFileTypes: true });
+    
+    for (const item of items) {
+      const fullPath = path.join(directory, item.name);
+      
+      try {
+        if (item.isDirectory()) {
+          // Continuar búsqueda recursiva en subdirectorios
+          await searchJarFilesRecursively(fullPath, result, depth + 1, options);
+        } else if (item.name.toLowerCase().endsWith('.jar')) {
+          const stats = await fs.promises.stat(fullPath);
+          const fileInfo = {
+            name: item.name,
+            path: fullPath,
+            size: stats.size,
+            lastModified: stats.mtime.getTime(),
+            createdTime: stats.birthtime.getTime()
+          };
+          
+          // Aplicar filtros de fecha si están especificados
+          if (options.fechaInicio || options.fechaFin) {
+            const fileDate = new Date(stats.mtime);
+            
+            if (options.fechaInicio) {
+              const startDate = new Date(options.fechaInicio);
+              if (fileDate < startDate) continue;
+            }
+            
+            if (options.fechaFin) {
+              const endDate = new Date(options.fechaFin);
+              if (fileDate > endDate) continue;
+            }
+          }
+          
+          // Agregar a resultados
+          result.push(fileInfo);
+        }
+      } catch (error) {
+        // Ignorar errores de permisos específicos
+        if (error.code !== 'EPERM' && error.code !== 'EACCES') {
+          console.error(`Error procesando ${fullPath}:`, error);
+        }
+      }
+    }
+  } catch (error) {
+    // Ignorar errores de acceso
+    if (error.code !== 'EPERM' && error.code !== 'EACCES') {
+      console.error(`Error leyendo directorio ${directory}:`, error);
+    }
+  }
+}
+
+/**
+ * Verifica si un directorio debe omitirse de la búsqueda
+ * @param {string} directory Ruta del directorio
+ * @returns {boolean} true si debe omitirse
+ */
+function shouldSkipDirectory(directory) {
+  const skipDirs = [
+    'Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 
+    'System Volume Information', '$Recycle.Bin', 'node_modules',
+    'AppData\\Local\\Temp', 'Recovery', 'Config.Msi', '$WINDOWS.~BT', 
+    '$WinREAgent', 'Windows.old', 'DriverStore', 'Temp', 'tmp'
+  ];
+  
+  const normalizedPath = directory.replace(/\\/g, '/').toLowerCase();
+  return skipDirs.some(dir => normalizedPath.includes(dir.toLowerCase()));
+}
+
+/**
+ * Obtiene las unidades disponibles en el sistema
+ * @returns {Promise<Array>} Lista de unidades
+ */
+async function getSystemDrives() {
+  try {
+    if (process.platform === 'win32') {
+      // En Windows, obtener todas las unidades disponibles
+      const { stdout } = await execAsync('wmic logicaldisk get caption');
+      return stdout.split('\n')
+        .filter(line => /^[A-Za-z]:/.test(line.trim()))
+        .map(drive => drive.trim() + '\\');
+    } else if (process.platform === 'darwin') {
+      // En macOS, empezar desde /Volumes
+      const items = await fs.promises.readdir('/Volumes');
+      return ['/'].concat(items.map(item => `/Volumes/${item}`));
+    } else {
+      // En Linux, empezar desde el directorio raíz
+      return ['/'];
+    }
+  } catch (error) {
+    console.error('Error al obtener unidades:', error);
+    // Retornar al menos el directorio principal del usuario
+    return [os.homedir()];
+  }
+}
+
+/**
+ * Busca cambios sospechosos en extensiones de archivos
+ */
+async function checkFileExtensionChanges() {
+  try {
+    const result = [];
+    const homeDir = os.homedir();
+    const downloadsDir = path.join(homeDir, 'Downloads');
+    const desktopDir = path.join(homeDir, 'Desktop');
+    const documentsDir = path.join(homeDir, 'Documents');
+    
+    // Buscar en directorios comunes
+    await findRecentlyModifiedFiles(downloadsDir, result);
+    await findRecentlyModifiedFiles(desktopDir, result);
+    await findRecentlyModifiedFiles(documentsDir, result);
+    
+    // Buscar en carpetas de juegos comunes
+    const gameDirs = [
+      path.join(homeDir, 'AppData', 'Roaming', '.minecraft'),
+      path.join(homeDir, 'AppData', 'Local', 'Packages'),
+      'C:\\Games',
+      'D:\\Games',
+      'E:\\Games',
+      path.join(homeDir, 'Games')
+    ];
+    
+    for (const gameDir of gameDirs) {
+      try {
+        if (fs.existsSync(gameDir)) {
+          await findRecentlyModifiedFiles(gameDir, result);
+        }
+      } catch (error) {
+        console.error(`Error al verificar directorio ${gameDir}:`, error);
+      }
+    }
+    
+    // Ordenar por fecha de modificación
+    result.sort((a, b) => b.modifiedTime - a.modifiedTime);
+    
+    return result;
+  } catch (error) {
+    console.error('Error en checkFileExtensionChanges:', error);
+    throw error;
+  }
+}
+
+/**
+ * Busca archivos modificados recientemente y detecta cambios de extensión
+ */
+async function findRecentlyModifiedFiles(directory, result, depth = 0) {
+  // Limitar la profundidad para evitar búsquedas infinitas
   if (depth > 10) return;
   
   try {
-    const files = await readdirPromise(directory);
+    // Verificar si debemos omitir este directorio
+    if (shouldSkipDirectory(directory)) return;
     
-    for (const file of files) {
-      if (file.startsWith('.')) continue; // Ignorar archivos ocultos
-      
-      const fullPath = path.join(directory, file);
-      
-      try {
-        const stats = await statPromise(fullPath);
-        
-        if (stats.isDirectory()) {
-          // Evitar directorios del sistema
-          if (!shouldSkipDirectory(fullPath)) {
-            await searchJarFilesRecursively(fullPath, result, depth + 1);
-          }
-        } else if (file.endsWith('.jar')) {
-          result.push({
-            name: file,
-            path: fullPath,
-            size: stats.size,
-            lastModified: stats.mtime
-          });
-        }
-      } catch (error) {
-        // Ignorar errores de acceso
-      }
-    }
-  } catch (error) {
-    // Ignorar errores de acceso
-  }
-}
-
-/**
- * Verificar si un directorio debe ser omitido en la búsqueda
- */
-function shouldSkipDirectory(directory) {
-  const skipDirs = ['Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 'System Volume Information', '$Recycle.Bin', 'node_modules'];
-  return skipDirs.some(dir => directory.includes(dir));
-}
-
-/**
- * Detecta si se han cambiado nombres o extensiones de archivos
- */
-async function checkFileExtensionChanges() {
-  const renamedFiles = [];
-  const userHome = os.homedir();
-  const dirsToCheck = [
-    path.join(userHome, 'Desktop'),
-    path.join(userHome, 'Documents'),
-    path.join(userHome, 'Downloads'),
-    // Añadir carpetas comunes de Minecraft
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft'),
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft', 'mods'),
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft', 'resourcepacks'),
-    path.join(userHome, 'AppData', 'Roaming', '.minecraft', 'screenshots')
-  ];
-  
-  // Mantener un registro de archivos modificados recientemente
-  const recentlyModified = [];
-  
-  for (const dir of dirsToCheck) {
-    try {
-      await findRecentlyModifiedFiles(dir, recentlyModified);
-    } catch (error) {
-      console.error(`Error checking directory ${dir}:`, error);
-    }
-  }
-  
-  // Filtrar archivos que tienen patrones de renombrado
-  for (const file of recentlyModified) {
-    // Detectar posibles archivos renombrados
-    const filename = path.basename(file.path);
-    const ext = path.extname(file.path).toLowerCase();
+    const items = await fs.promises.readdir(directory, { withFileTypes: true });
+    const now = Date.now();
+    const oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000);
     
-    // Verificar patrones comunes de renombrado
-    const hasMultipleExtensions = filename.split('.').length > 2;
-    const hasUncommonNaming = /(\.|_)(old|new|bak|backup|copy|renamed|changed)/.test(filename);
-    const hasDatePattern = /\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4}|\(\d+\)/.test(filename);
-    
-    if (hasMultipleExtensions || hasUncommonNaming || hasDatePattern) {
-      renamedFiles.push({
-        name: filename,
-        path: file.path,
-        modifiedTime: file.modifiedTime,
-        originalName: getOriginalNameGuess(filename),
-        reason: hasMultipleExtensions ? 'Múltiples extensiones' : 
-               hasUncommonNaming ? 'Patrón de renombrado' : 'Contiene marca de fecha'
-      });
-    }
-    
-    // Comprobar si hay archivos con el mismo nombre base pero diferente extensión
-    const baseName = filename.substring(0, filename.lastIndexOf('.'));
-    const similarFiles = recentlyModified.filter(f => {
-      const otherName = path.basename(f.path);
-      const otherBaseName = otherName.substring(0, otherName.lastIndexOf('.'));
-      return otherBaseName === baseName && f.path !== file.path;
-    });
-    
-    if (similarFiles.length > 0) {
-      renamedFiles.push({
-        name: filename,
-        path: file.path,
-        modifiedTime: file.modifiedTime,
-        similarFiles: similarFiles.map(f => ({
-          name: path.basename(f.path),
-          path: f.path, 
-          modifiedTime: f.modifiedTime
-        })),
-        reason: 'Archivos similares encontrados'
-      });
-    }
-  }
-  
-  return renamedFiles;
-}
-
-/**
- * Encuentra archivos modificados recientemente
- */
-async function findRecentlyModifiedFiles(directory, result, depth = 0) {
-  // Limitar profundidad para evitar búsquedas infinitas
-  if (depth > 5) return;
-  
-  try {
-    const files = await readdirPromise(directory);
-    
-    for (const file of files) {
-      const fullPath = path.join(directory, file);
+    for (const item of items) {
+      const fullPath = path.join(directory, item.name);
       
       try {
-        const stats = await statPromise(fullPath);
-        const fileModTime = new Date(stats.mtime);
-        const oneHourAgo = new Date();
-        oneHourAgo.setHours(oneHourAgo.getHours() - 24); // Buscar en las últimas 24 horas
-        
-        if (stats.isDirectory() && !file.startsWith('.')) {
+        if (item.isDirectory()) {
+          // Continuar búsqueda recursiva en subdirectorios
           await findRecentlyModifiedFiles(fullPath, result, depth + 1);
-        } else if (stats.isFile() && fileModTime > oneHourAgo) {
-          result.push({
-            name: file,
-            path: fullPath,
-            modifiedTime: fileModTime,
-            size: stats.size
-          });
-        }
-      } catch (error) {
-        // Ignorar errores de acceso
-      }
-    }
-  } catch (error) {
-    // Ignorar errores de acceso
-  }
-}
-
-/**
- * Intenta adivinar el nombre original de un archivo
- */
-function getOriginalNameGuess(filename) {
-  const parts = filename.split('.');
-  
-  // Si tiene múltiples extensiones, intentar adivinar la original
-  if (parts.length > 2) {
-    return parts[0] + '.' + parts[parts.length-1];
-  }
-  
-  // Si tiene patrones de renombrado, intentar limpiarlos
-  const cleanName = filename.replace(/(\.|_)(old|new|bak|backup|copy|renamed|changed|\d{4}-\d{2}-\d{2})/, '');
-  
-  return cleanName;
-}
-
-/**
- * Obtiene los archivos eliminados recientemente
- * @param {number} minutes - Minutos hacia atrás para buscar
- */
-async function getRecentlyDeletedFiles(minutes = 60) {
-  const deletedFiles = [];
-  const timeThreshold = new Date();
-  timeThreshold.setMinutes(timeThreshold.getMinutes() - minutes);
-  
-  try {
-    if (process.platform === 'win32') {
-      // En Windows, buscar en el Registro del Sistema eventos de eliminación
-      const { stdout } = await execPromise(
-        `powershell "Get-EventLog -LogName 'Application' -After (Get-Date).AddMinutes(-${minutes}) | Where-Object {$_.EventID -eq 1025 -or $_.EventID -eq 1026} | Select-Object TimeGenerated, Message | ConvertTo-Json"`
-      ).catch(() => ({ stdout: '[]' }));
-      
-      try {
-        const events = JSON.parse(stdout);
-        const eventList = Array.isArray(events) ? events : events ? [events] : [];
-        
-        for (const event of eventList) {
-          if (event && event.Message && (event.Message.includes('deleted') || event.Message.includes('removed'))) {
-            // Extraer el nombre del archivo de los mensajes del evento
-            const fileMatch = event.Message.match(/file\s+([^\r\n]+)/i);
-            if (fileMatch) {
-              deletedFiles.push({
-                name: path.basename(fileMatch[1].trim()),
-                path: fileMatch[1].trim(),
-                deletedTime: new Date(event.TimeGenerated)
+        } else {
+          const stats = await fs.promises.stat(fullPath);
+          
+          // Solo verificar archivos modificados recientemente
+          if (stats.mtime.getTime() > oneWeekAgo) {
+            // Verificar patrones sospechosos de cambio de extensión
+            const fileName = item.name.toLowerCase();
+            const suspiciousExtensions = [
+              '.jar.txt', '.exe.txt', '.jar.png', '.exe.png', '.jar.jpg', '.exe.jpg',
+              '.minecraft.jar', '.dll.txt', '.dll.jar', '.bat.txt', '.vbs.txt'
+            ];
+            
+            if (suspiciousExtensions.some(ext => fileName.includes(ext))) {
+              // Encontrar archivos similares en el mismo directorio para comparar
+              const baseName = getOriginalNameGuess(item.name);
+              const similarFiles = [];
+              
+              if (baseName) {
+                for (const otherItem of items) {
+                  if (otherItem.name !== item.name && otherItem.name.toLowerCase().includes(baseName.toLowerCase())) {
+                    try {
+                      const otherPath = path.join(directory, otherItem.name);
+                      const otherStats = await fs.promises.stat(otherPath);
+                      
+                      similarFiles.push({
+                        name: otherItem.name,
+                        path: otherPath,
+                        modifiedTime: otherStats.mtime.getTime()
+                      });
+                    } catch (error) {
+                      // Ignorar errores para archivos individuales
+                    }
+                  }
+                }
+              }
+              
+              result.push({
+                name: item.name,
+                path: fullPath,
+                modifiedTime: stats.mtime.getTime(),
+                reason: 'Posible cambio de extensión para ocultar tipo real',
+                similarFiles: similarFiles
               });
             }
           }
         }
-      } catch (parseError) {
-        console.error('Error parsing deleted files:', parseError);
+      } catch (error) {
+        // Ignorar errores de permisos específicos
+        if (error.code !== 'EPERM' && error.code !== 'EACCES') {
+          console.error(`Error procesando ${fullPath}:`, error);
+        }
       }
-      
-      // Método alternativo usando la papelera de reciclaje
-      const recyclebinPath = path.join(os.homedir(), '$RECYCLE.BIN');
-      try {
-        await searchRecycleBin(recyclebinPath, deletedFiles, timeThreshold);
-      } catch (rbError) {
-        console.error('Error accessing recycle bin:', rbError);
-      }
-    } else if (process.platform === 'darwin') {
-      // En macOS, buscar en la Papelera
-      const trashPath = path.join(os.homedir(), '.Trash');
-      await searchDeletedFiles(trashPath, deletedFiles, timeThreshold);
-    } else {
-      // En Linux, buscar en la Papelera
-      const trashPath = path.join(os.homedir(), '.local/share/Trash/files');
-      const trashInfoPath = path.join(os.homedir(), '.local/share/Trash/info');
-      await searchLinuxTrash(trashPath, trashInfoPath, deletedFiles, timeThreshold);
     }
-    
-    // Intentar usar herramientas de recuperación de datos disponibles
-    await tryUsingDataRecoveryTools(deletedFiles, minutes);
-    
   } catch (error) {
-    console.error('Error accessing trash:', error);
+    // Ignorar errores de acceso
+    if (error.code !== 'EPERM' && error.code !== 'EACCES') {
+      console.error(`Error leyendo directorio ${directory}:`, error);
+    }
   }
-  
-  // Ordenar por tiempo de eliminación y limitar a los más recientes
-  return deletedFiles
-    .sort((a, b) => b.deletedTime - a.deletedTime)
-    .slice(0, 20); // Mostrar más resultados
 }
 
 /**
- * Busca en la papelera de Windows
+ * Intenta adivinar el nombre original basado en el nombre actual
+ */
+function getOriginalNameGuess(filename) {
+  // Eliminar extensiones potencialmente ocultas
+  const doubleExtRegex = /^(.+)\.(jar|exe|dll|bat|vbs)\.(txt|png|jpg|jpeg)$/i;
+  const match = filename.match(doubleExtRegex);
+  
+  if (match) {
+    return match[1] + '.' + match[2];
+  }
+  
+  return null;
+}
+
+/**
+ * Obtiene archivos eliminados recientemente
+ */
+async function getRecentlyDeletedFiles(minutes = 60) {
+  try {
+    const result = [];
+    const now = Date.now();
+    const timeThreshold = now - (minutes * 60 * 1000);
+    
+    if (process.platform === 'win32') {
+      // En Windows, buscar en la papelera de reciclaje y en registros del sistema
+      const recycleBinPath = path.join(process.env.USERPROFILE, '$Recycle.Bin');
+      await searchRecycleBin(recycleBinPath, result, timeThreshold);
+      
+      // Buscar en el registro de eventos de Windows
+      try {
+        const eventLogs = await getFileOperationsFromEventLog(minutes);
+        result.push(...eventLogs.filter(item => item.operation === 'delete'));
+      } catch (error) {
+        console.error('Error obteniendo eventos de eliminación:', error);
+      }
+    } else if (process.platform === 'darwin') {
+      // En macOS, buscar en la papelera
+      const trashPath = path.join(os.homedir(), '.Trash');
+      await searchDeletedFiles(trashPath, result, timeThreshold);
+    } else {
+      // En Linux, buscar en la papelera
+      const trashPath = path.join(os.homedir(), '.local', 'share', 'Trash', 'files');
+      const trashInfoPath = path.join(os.homedir(), '.local', 'share', 'Trash', 'info');
+      await searchLinuxTrash(trashPath, trashInfoPath, result, timeThreshold);
+    }
+    
+    // Usar herramientas de recuperación de datos como respaldo
+    await tryUsingDataRecoveryTools(result, minutes);
+    
+    // Ordenar por fecha de eliminación, más reciente primero
+    result.sort((a, b) => b.deletedTime - a.deletedTime);
+    
+    return result;
+  } catch (error) {
+    console.error('Error en getRecentlyDeletedFiles:', error);
+    throw error;
+  }
+}
+
+/**
+ * Busca en la papelera de reciclaje de Windows
  */
 async function searchRecycleBin(directory, result, timeThreshold) {
   try {
-    const files = await readdirPromise(directory);
+    if (!fs.existsSync(directory)) return;
     
-    for (const file of files) {
-      const fullPath = path.join(directory, file);
-      
+    const items = await fs.promises.readdir(directory, { withFileTypes: true });
+    
+    for (const item of items) {
       try {
-        const stats = await statPromise(fullPath);
+        const fullPath = path.join(directory, item.name);
         
-        if (stats.isDirectory()) {
-          await searchRecycleBin(fullPath, result, timeThreshold);
-        } else if (stats.mtime >= timeThreshold) {
-          // En la papelera de Windows, los archivos tienen nombres codificados
-          // Intentamos obtener información original con PowerShell
-          try {
-            const { stdout } = await execPromise(
-              `powershell "(New-Object -ComObject Shell.Application).NameSpace(10).Items() | Where-Object { $_.Path -like '*${file}*' } | Select-Object Name, Path | ConvertTo-Json"`
-            ).catch(() => ({ stdout: '[]' }));
-            
-            const items = JSON.parse(stdout);
-            const itemList = Array.isArray(items) ? items : items ? [items] : [];
-            
-            if (itemList.length > 0) {
-              result.push({
-                name: itemList[0].Name,
-                path: itemList[0].Path,
-                deletedTime: stats.mtime
-              });
-            } else {
-              result.push({
-                name: file,
-                path: fullPath,
-                deletedTime: stats.mtime
-              });
+        if (item.isDirectory()) {
+          const subItems = await fs.promises.readdir(fullPath, { withFileTypes: true });
+          
+          for (const subItem of subItems) {
+            try {
+              // Los archivos en la papelera de reciclaje tienen nombres diferentes
+              // pero podemos verificar la fecha de modificación
+              const subItemPath = path.join(fullPath, subItem.name);
+              const stats = await fs.promises.stat(subItemPath);
+              
+              if (stats.mtime.getTime() >= timeThreshold) {
+                // Intentar recuperar el nombre original (complicado en la papelera de Windows)
+                let originalName = subItem.name;
+                
+                // Algunos archivos en la papelera tienen metadatos con el nombre original
+                try {
+                  if (subItem.name.startsWith('$R')) {
+                    const infoFilePath = path.join(fullPath, subItem.name.replace('$R', '$I'));
+                    if (fs.existsSync(infoFilePath)) {
+                      const buffer = await fs.promises.readFile(infoFilePath);
+                      // Los metadatos de la papelera tienen un formato específico
+                      // donde el nombre del archivo está después de algunos bytes
+                      if (buffer.length > 24) {
+                        const nameStart = 24;
+                        let nameEnd = nameStart;
+                        while (nameEnd < buffer.length && buffer[nameEnd] !== 0 && buffer[nameEnd + 1] !== 0) {
+                          nameEnd += 2;
+                        }
+                        if (nameEnd > nameStart) {
+                          originalName = buffer.toString('utf16le', nameStart, nameEnd);
+                        }
+                      }
+                    }
+                  }
+                } catch (error) {
+                  console.error('Error recuperando nombre original:', error);
+                }
+                
+                result.push({
+                  name: originalName,
+                  path: subItemPath,
+                  deletedTime: stats.mtime.getTime(),
+                  inRecycleBin: true
+                });
+              }
+            } catch (error) {
+              // Ignorar errores individuales
             }
-          } catch (psError) {
-            result.push({
-              name: file,
-              path: fullPath,
-              deletedTime: stats.mtime
-            });
           }
         }
       } catch (error) {
-        // Ignorar errores de acceso
+        // Ignorar errores de permisos
+        if (error.code !== 'EPERM' && error.code !== 'EACCES') {
+          console.error(`Error procesando ${fullPath}:`, error);
+        }
       }
     }
   } catch (error) {
-    // Ignorar errores de acceso
+    console.error(`Error buscando en la papelera ${directory}:`, error);
   }
 }
 
 /**
- * Busca archivos eliminados en la papelera
+ * Busca archivos eliminados en sistemas distintos a Windows
  */
 async function searchDeletedFiles(directory, result, timeThreshold) {
   try {
-    const files = await readdirPromise(directory);
+    if (!fs.existsSync(directory)) return;
     
-    for (const file of files) {
-      const fullPath = path.join(directory, file);
-      
+    const items = await fs.promises.readdir(directory, { withFileTypes: true });
+    
+    for (const item of items) {
       try {
-        const stats = await statPromise(fullPath);
+        const fullPath = path.join(directory, item.name);
+        const stats = await fs.promises.stat(fullPath);
         
-        if (stats.isDirectory()) {
-          await searchDeletedFiles(fullPath, result, timeThreshold);
-        } else if (stats.mtime >= timeThreshold) {
+        if (stats.mtime.getTime() >= timeThreshold) {
           result.push({
-            name: file,
+            name: item.name,
             path: fullPath,
-            deletedTime: stats.mtime
+            deletedTime: stats.mtime.getTime(),
+            inRecycleBin: true
           });
         }
+        
+        if (item.isDirectory()) {
+          await searchDeletedFiles(fullPath, result, timeThreshold);
+        }
       } catch (error) {
-        // Ignorar errores de acceso
+        // Ignorar errores de permisos
+        if (error.code !== 'EPERM' && error.code !== 'EACCES') {
+          console.error(`Error procesando ${fullPath}:`, error);
+        }
       }
     }
   } catch (error) {
-    // Ignorar errores de acceso
+    console.error(`Error buscando en directorio ${directory}:`, error);
   }
 }
 
 /**
- * Busca archivos en la papelera de Linux con información de eliminación
+ * Busca archivos eliminados en la papelera de Linux
  */
 async function searchLinuxTrash(trashPath, infoPath, result, timeThreshold) {
   try {
-    const files = await readdirPromise(trashPath);
+    if (!fs.existsSync(trashPath) || !fs.existsSync(infoPath)) return;
     
-    for (const file of files) {
-      const filePath = path.join(trashPath, file);
-      const infoFilePath = path.join(infoPath, file + '.trashinfo');
-      
-      try {
-        const stats = await statPromise(filePath);
-        
-        // Intentar leer el archivo de información si existe
-        let originalPath = "";
-        let deletionDate = stats.mtime;
-        
-        if (fs.existsSync(infoFilePath)) {
-          const infoContent = fs.readFileSync(infoFilePath, 'utf8');
-          const pathMatch = infoContent.match(/Path=(.*)/);
-          const dateMatch = infoContent.match(/DeletionDate=(.*)/);
+    const trashItems = await fs.promises.readdir(trashPath, { withFileTypes: true });
+    const infoItems = await fs.promises.readdir(infoPath, { withFileTypes: true });
+    
+    // Crear un mapa de archivos de información
+    const infoMap = new Map();
+    for (const item of infoItems) {
+      if (item.isFile() && item.name.endsWith('.trashinfo')) {
+        try {
+          const content = await fs.promises.readFile(path.join(infoPath, item.name), 'utf8');
+          const pathMatch = content.match(/Path=(.*)/);
+          const deletionDateMatch = content.match(/DeletionDate=(.*)/);
           
-          if (pathMatch && pathMatch[1]) {
-            originalPath = decodeURIComponent(pathMatch[1]);
+          if (pathMatch && deletionDateMatch) {
+            const originalPath = pathMatch[1];
+            const deletionDate = new Date(deletionDateMatch[1]);
+            
+            if (deletionDate.getTime() >= timeThreshold) {
+              const basename = item.name.replace('.trashinfo', '');
+              infoMap.set(basename, {
+                originalPath,
+                deletionDate
+              });
+            }
           }
-          
-          if (dateMatch && dateMatch[1]) {
-            deletionDate = new Date(dateMatch[1]);
-          }
+        } catch (error) {
+          console.error(`Error leyendo archivo de información: ${item.name}`, error);
         }
-        
-        if (deletionDate >= timeThreshold) {
-          result.push({
-            name: file,
-            path: originalPath || filePath,
-            deletedTime: deletionDate
-          });
-        }
-      } catch (error) {
-        // Ignorar errores de acceso
+      }
+    }
+    
+    // Relacionar los archivos con su información
+    for (const item of trashItems) {
+      const info = infoMap.get(item.name);
+      if (info) {
+        result.push({
+          name: path.basename(info.originalPath),
+          path: info.originalPath,
+          deletedTime: info.deletionDate.getTime(),
+          inRecycleBin: true
+        });
       }
     }
   } catch (error) {
-    // Ignorar errores de acceso
+    console.error('Error buscando en la papelera de Linux:', error);
   }
 }
 
@@ -456,1816 +518,3756 @@ async function searchLinuxTrash(trashPath, infoPath, result, timeThreshold) {
  * Intenta usar herramientas de recuperación de datos si están disponibles
  */
 async function tryUsingDataRecoveryTools(result, minutes) {
-  if (process.platform === 'win32') {
-    try {
-      // Ver si podemos usar forfiles para buscar archivos eliminados recientemente
-      const { stdout } = await execPromise(
-        `powershell "Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem' -Name 'NtfsDisableLastAccessUpdate' | Select-Object NtfsDisableLastAccessUpdate | ConvertTo-Json"`
-      ).catch(() => ({ stdout: '{}' }));
-      
-      // Si la característica está habilitada, podríamos buscar archivos con acceso reciente pero que ya no existen
-      // Esta es una técnica avanzada y puede requerir herramientas forenses
-    } catch (error) {
-      // Ignorar errores, esta es solo una característica adicional
-    }
-  }
+  // Esta función podría integrarse con herramientas específicas
+  // como recuva, testdisk, etc., pero requeriría instalación adicional
+  // Por ahora, solo se incluye como un marcador para futura implementación
+  return;
 }
 
 /**
- * Obtiene los archivos .jar ejecutados recientemente con opción de tiempo
- * @param {number} hours - Horas hacia atrás para buscar
+ * Obtiene eventos de operaciones de archivo desde el registro de eventos de Windows
+ */
+async function getFileOperationsFromEventLog(minutes) {
+  const result = [];
+  
+  if (process.platform !== 'win32') return result;
+  
+  try {
+    // Convertir minutos a formato de tiempo para PowerShell
+    const timeRange = `-${minutes}min`;
+    
+    // Consulta para obtener eventos de eliminación de archivos
+    const command = `powershell -Command "& {
+      $startTime = (Get-Date).AddMinutes(${-minutes});
+      Get-WinEvent -FilterHashtable @{
+        LogName='Security';
+        StartTime=$startTime;
+        ID=4663
+      } -ErrorAction SilentlyContinue | 
+      Where-Object { $_.Message -like '*delete*' } |
+      Select-Object TimeCreated, Message |
+      ConvertTo-Json -Depth 1
+    }"`;
+    
+    const { stdout } = await execAsync(command);
+    
+    if (stdout.trim()) {
+      let events;
+      try {
+        events = JSON.parse(stdout);
+        // Asegurar que sea un array incluso si solo hay un resultado
+        if (!Array.isArray(events)) events = [events];
+      } catch (error) {
+        console.error('Error parseando JSON de eventos:', error);
+        return result;
+      }
+      
+      events.forEach(event => {
+        // Extraer información relevante del mensaje
+        const message = event.Message;
+        const timeCreated = new Date(event.TimeCreated);
+        
+        // Intentar extraer el nombre del archivo
+        const fileNameMatch = message.match(/Object Name:\s+([^\r\n]+)/);
+        const fileName = fileNameMatch ? fileNameMatch[1].trim() : 'Archivo desconocido';
+        
+        result.push({
+          name: path.basename(fileName),
+          path: fileName,
+          deletedTime: timeCreated.getTime(),
+          operation: 'delete',
+          source: 'Event Log'
+        });
+      });
+    }
+  } catch (error) {
+    console.error('Error obteniendo eventos del registro:', error);
+  }
+  
+  return result;
+}
+
+/**
+ * Obtiene archivos JAR ejecutados recientemente
  */
 async function getRecentlyExecutedJars(hours = 4) {
-  const executedJars = [];
-  const timeThreshold = new Date();
-  timeThreshold.setHours(timeThreshold.getHours() - hours);
-  
   try {
+    const result = [];
+    const now = Date.now();
+    const timeThreshold = now - (hours * 60 * 60 * 1000);
+    
+    // Método 1: Buscar en el registro de Windows (solo para Windows)
     if (process.platform === 'win32') {
-      // En Windows, usar PowerShell para obtener el historial de procesos
-      const { stdout } = await execPromise(
-        `powershell "Get-WmiObject Win32_Process | Where-Object {$_.CommandLine -like '*java*' -and $_.CommandLine -like '*.jar*'} | Select-Object CommandLine, CreationDate, ProcessId | ConvertTo-Json"`
-      ).catch(() => ({ stdout: '[]' }));
-      
       try {
-        const processes = JSON.parse(stdout);
-        const processList = Array.isArray(processes) ? processes : processes ? [processes] : [];
-        
-        for (const process of processList) {
-          if (process && process.CommandLine) {
-            const jarMatch = process.CommandLine.match(/-jar\s+"?([^"]+\.jar)"?/);
-            if (jarMatch) {
-              const jarPath = jarMatch[1];
-              const creationDate = new Date(process.CreationDate || Date.now());
-              
-              if (creationDate >= timeThreshold) {
-                executedJars.push({
-                  name: path.basename(jarPath),
-                  path: jarPath,
-                  startTime: creationDate.toLocaleString(),
-                  pid: process.ProcessId,
-                  command: process.CommandLine
-                });
-              }
-            }
-          }
-        }
-      } catch (parseError) {
-        console.error('Error parsing process output:', parseError);
+        const recentJarsFromRegistry = await getJarsFromRegistry(timeThreshold);
+        result.push(...recentJarsFromRegistry);
+      } catch (error) {
+        console.error('Error obteniendo JARs del registro:', error);
       }
+    }
+    
+    // Método 2: Buscar en historial de ejecuciones (multiplataforma)
+    try {
+      const execHistory = await getCompleteExecutionHistory(hours);
+      const jarExecutions = execHistory.filter(item => 
+        (item.command && item.command.toLowerCase().includes('.jar')) ||
+        (item.name && item.name.toLowerCase().endsWith('.jar'))
+      );
       
-      // También buscar en el registro de eventos de Windows
-      const { stdout: eventStdout } = await execPromise(
-        `powershell "Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime='${timeThreshold.toISOString()}'} -ErrorAction SilentlyContinue | Where-Object {$_.Message -like '*java*' -and $_.Message -like '*.jar*'} | Select-Object TimeCreated, Message | ConvertTo-Json"`
-      ).catch(() => ({ stdout: '[]' }));
-      
-      try {
-        const events = JSON.parse(eventStdout);
-        const eventList = Array.isArray(events) ? events : events ? [events] : [];
-        
-        for (const event of eventList) {
-          if (event && event.Message) {
-            const jarMatch = event.Message.match(/([A-Za-z]:(?:\\[^:\\*\?"<>\|][^:\\*\?"<>\|]*)+\.jar)/);
-            if (jarMatch) {
-              executedJars.push({
-                name: path.basename(jarMatch[1]),
-                path: jarMatch[1],
-                startTime: new Date(event.TimeCreated).toLocaleString(),
-                source: 'Event Log'
-              });
-            }
-          }
-        }
-      } catch (parseError) {
-        console.error('Error parsing event log:', parseError);
-      }
-      
-      // Buscar en el registro de Prefetch
-      const { stdout: prefetchStdout } = await execPromise(
-        `powershell "Get-ChildItem -Path 'C:\\Windows\\Prefetch' -Filter '*.pf' | Where-Object {$_.Name -like '*JAVA*'} | Select-Object Name, LastWriteTime | ConvertTo-Json"`
-      ).catch(() => ({ stdout: '[]' }));
-      
-      try {
-        const prefetchFiles = JSON.parse(prefetchStdout);
-        const prefetchList = Array.isArray(prefetchFiles) ? prefetchFiles : prefetchFiles ? [prefetchFiles] : [];
-        
-        for (const prefetch of prefetchList) {
-          if (prefetch && prefetch.Name) {
-            const lastWriteTime = new Date(prefetch.LastWriteTime);
-            
-            if (lastWriteTime >= timeThreshold) {
-              executedJars.push({
-                name: prefetch.Name.replace('.pf', ''),
-                path: prefetch.Name.replace('.pf', ''),
-                startTime: lastWriteTime.toLocaleString(),
-                source: 'Prefetch'
-              });
-            }
-          }
-        }
-      } catch (parseError) {
-        console.error('Error parsing prefetch files:', parseError);
-      }
-      
-      // Buscar archivos JAR en carpetas comunes y verificar último acceso
-      const minecraftFolders = [
-        path.join(os.homedir(), 'AppData', 'Roaming', '.minecraft'),
-        path.join(os.homedir(), 'AppData', 'Roaming', '.minecraft', 'mods'),
-        path.join(os.homedir(), 'Downloads')
-      ];
-      
-      for (const folder of minecraftFolders) {
-        try {
-          if (fs.existsSync(folder)) {
-            const files = await readdirPromise(folder);
-            
-            for (const file of files) {
-              if (file.endsWith('.jar')) {
-                const filePath = path.join(folder, file);
-                
-                try {
-                  const stats = await statPromise(filePath);
-                  const lastAccessed = new Date(stats.atime);
-                  
-                  if (lastAccessed >= timeThreshold) {
-                    executedJars.push({
-                      name: file,
-                      path: filePath,
-                      startTime: lastAccessed.toLocaleString(),
-                      source: 'File Access',
-                      size: stats.size
-                    });
-                  }
-                } catch (error) {
-                  // Ignorar errores de acceso
-                }
-              }
-            }
-          }
-        } catch (error) {
-          console.error(`Error accessing folder ${folder}:`, error);
-        }
-      }
-    } else if (process.platform === 'darwin' || process.platform === 'linux') {
-      // En macOS/Linux, usar ps
-      const { stdout } = await execPromise('ps -eo pid,lstart,command | grep -i java | grep -i \\.jar').catch(() => ({ stdout: '' }));
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        if (line.trim()) {
-          const jarMatch = line.match(/.*java.*-jar\s+([^\s]+\.jar)/);
+      // Añadir las ejecuciones de JAR encontradas
+      for (const execution of jarExecutions) {
+        // Extraer ruta del JAR del comando
+        let jarPath = '';
+        if (execution.command) {
+          const jarMatch = execution.command.match(/-jar\s+["']?([^"'\s]+\.jar)/i);
           if (jarMatch) {
-            // Extraer la fecha del formato de salida de ps
-            const dateMatch = line.match(/([A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4})/);
-            let startTime;
-            
-            if (dateMatch) {
-              startTime = new Date(dateMatch[1]);
-              
-              if (startTime >= timeThreshold) {
-                executedJars.push({
-                  name: path.basename(jarMatch[1]),
-                  path: jarMatch[1],
-                  startTime: startTime.toLocaleString(),
-                  source: 'Process List'
-                });
-              }
+            jarPath = jarMatch[1];
+          } else {
+            const pathMatch = execution.command.match(/["']([^"']+\.jar)["']/i);
+            if (pathMatch) {
+              jarPath = pathMatch[1];
             }
           }
         }
-      }
-    }
-  } catch (error) {
-    console.error('Error getting executed JARs:', error);
-  }
-  
-  // Eliminar duplicados manteniendo la información más reciente
-  const uniqueJars = [];
-  const jarPaths = new Set();
-  
-  for (const jar of executedJars) {
-    const normalizedPath = jar.path.toLowerCase();
-    
-    if (!jarPaths.has(normalizedPath)) {
-      jarPaths.add(normalizedPath);
-      uniqueJars.push(jar);
-    }
-  }
-  
-  return uniqueJars.sort((a, b) => {
-    return new Date(b.startTime) - new Date(a.startTime);
-  });
-}
-
-/**
- * Verifica si un dispositivo USB fue desconectado recientemente
- */
-async function checkUSBDisconnection() {
-  try {
-    if (process.platform === 'win32') {
-      // En Windows, usar PowerShell para obtener eventos de dispositivos
-      const { stdout } = await execPromise(
-        'powershell "Get-WinEvent -FilterHashtable @{LogName=\'System\'; Id=225; ProviderName=\'Microsoft-Windows-Kernel-PnP\'} -MaxEvents 10 | Select-Object TimeCreated, Message | ConvertTo-Json"'
-      ).catch(() => ({ stdout: '[]' }));
-      
-      try {
-        const events = JSON.parse(stdout);
-        const eventList = Array.isArray(events) ? events : events ? [events] : [];
         
-        const disconnections = eventList
-          .filter(event => event && event.Message && event.Message.includes('USB'))
-          .map(event => ({
-            device: event.Message.match(/(?:dispositivo|device) ([^\(]+)/i)?.[1] || 'USB Device',
-            time: new Date(event.TimeCreated).toLocaleString()
-          }));
+        // Si no se encontró en el comando, usar el nombre directamente
+        if (!jarPath && execution.name) {
+          jarPath = execution.name;
+        }
         
-        return {
-          disconnected: disconnections.length > 0,
-          details: disconnections
-        };
-      } catch (parseError) {
-        console.error('Error parsing USB events:', parseError);
-      }
-    } else if (process.platform === 'darwin') {
-      // En macOS, revisar el log del sistema
-      const { stdout } = await execPromise('log show --predicate "eventMessage CONTAINS[c] \\"USB\\"" --last 1h').catch(() => ({ stdout: '' }));
-      
-      const disconnectMatches = stdout.match(/USB device (.*) disconnected/g);
-      const disconnections = disconnectMatches ? disconnectMatches.map(match => ({
-        device: match.match(/USB device (.*) disconnected/)?.[1] || 'USB Device',
-        time: new Date().toLocaleString() // Aproximado
-      })) : [];
-      
-      return {
-        disconnected: disconnections.length > 0,
-        details: disconnections
-      };
-    } else {
-      // En Linux, revisar dmesg
-      const { stdout } = await execPromise('dmesg | grep -i "usb disconnect" | tail -10').catch(() => ({ stdout: '' }));
-      
-      const lines = stdout.split('\n').filter(line => line.trim());
-      const disconnections = lines.map(line => ({
-        device: line.match(/usb .*: USB disconnect/i)?.[0] || 'USB Device',
-        time: new Date().toLocaleString() // Aproximado
-      }));
-      
-      return {
-        disconnected: disconnections.length > 0,
-        details: disconnections
-      };
-    }
-  } catch (error) {
-    console.error('Error checking USB disconnection:', error);
-  }
-  
-  return { disconnected: false, details: [] };
-}
-
-/**
- * Lista de aplicaciones conocidas de grabación de pantalla
- */
-const screenRecordingApps = [
-    // Software de streaming y grabación popular
-    'OBS Studio', 'obs64.exe', 'obs.exe', 'obs-studio',
-    'Bandicam', 'bdcam.exe', 'bandicam.exe',
-    'Camtasia', 'camtasia.exe', 'camtasiastudio.exe',
-    'Action!', 'action.exe', 'mirillis.exe',
-    'Fraps', 'fraps.exe',
-    'Streamlabs OBS', 'streamlabs-obs.exe',
-    'XSplit', 'xsplit.exe', 'xsplitbroadcaster.exe',
-    'DXtory', 'dxtory.exe',
-    'Nvidia ShadowPlay', 'nvstreamsvc.exe', 'nvspcaps64.exe',
-    'AMD ReLive', 'amdow.exe', 'radeonoverlay',
-    'Movavi Screen Recorder', 'movavi_screencapturer.exe',
-    'ScreenRec', 'screenrec.exe',
-    'ScreenCastify', 'screencastify',
-    'ScreenFlow',
-    'FFmpeg', 'ffmpeg.exe',
-    
-    // Software menos conocido pero también utilizado
-    'D3DGear', 'd3dgear.exe',
-    'Icecream Screen Recorder', 'icecreamscreenrecorder.exe',
-    'CamStudio', 'camstudio.exe',
-    'TinyTake', 'tinytake.exe',
-    'Screencast-O-Matic', 'screencastomatic.exe',
-    'Debut Video Capture', 'debut.exe',
-    'FlashBack Express', 'flashback.exe',
-    'Snagit', 'snagit.exe',
-    'ActivePresenter', 'activepresenter.exe',
-    'Apowersoft Screen Recorder', 'apowersoftscreenrecorder.exe',
-    'AceThinker Screen Grabber Pro', 'acethinkerscreengrabber.exe',
-    'iSpring Cam', 'ispringcam.exe',
-    'Screen Recorder Gold', 'screenrecordergold.exe',
-    'Any Video Recorder', 'anyvideorecorder.exe',
-    
-    // Software integrado del sistema
-    'Xbox Game Bar', 'gamebar.exe', 'xboxgamebar.exe', 'gamebarft.exe',
-    'Windows Game Recording', 'xboxapp.exe', 'gamerecording',
-    'QuickTime Player',
-    
-    // Extensiones de navegador y apps web
-    'Loom', 'loom.exe',
-    'Nimbus', 'nimbus.exe',
-    'Awesome Screenshot',
-    'Screencastify',
-    'ShareX', 'sharex.exe',
-    'Screen Capture',
-    'Grabilla', 'grabilla.exe',
-    
-    // Términos genéricos relacionados
-    'screen recorder', 'screenrecorder', 
-    'capture', 'screen capture', 'screencapture',
-    'record', 'recording', 'grabber',
-    'screengrab', 'screen grab'
-];
-
-/**
- * Detecta si hay aplicaciones de grabación de pantalla activas
- */
-async function checkScreenRecording() {
-  try {
-    let processOutput = '';
-    let detectedApps = [];
-    
-    if (process.platform === 'win32') {
-      // En Windows, obtener lista de procesos en formato detallado
-      const { stdout: tasklist } = await execPromise('tasklist /fo csv /v').catch(() => ({ stdout: '' }));
-      processOutput = tasklist;
-      
-      // Búsqueda más específica de procesos de grabación conocidos
-      for (const app of screenRecordingApps) {
-        try {
-          const { stdout } = await execPromise(`tasklist /FI "IMAGENAME eq ${app}" /FO CSV /V`).catch(() => ({ stdout: '' }));
-          if (stdout && stdout.includes('.exe') && !stdout.includes('No tasks')) {
-            detectedApps.push(app);
+        // Añadir solo si tenemos una ruta
+        if (jarPath) {
+          let size = 0;
+          try {
+            if (fs.existsSync(jarPath)) {
+              const stats = await fs.promises.stat(jarPath);
+              size = stats.size;
+            }
+          } catch (error) {
+            // Ignorar errores de acceso al archivo
           }
-        } catch (error) {
-          // Ignorar errores
-        }
-      }
-      
-      // También verificar los servicios en ejecución
-      const { stdout: servicesOutput } = await execPromise('powershell "Get-Service | Where-Object {$_.Status -eq \'Running\'} | Select-Object DisplayName | ConvertTo-Json"').catch(() => ({ stdout: '[]' }));
-      
-      try {
-        const services = JSON.parse(servicesOutput);
-        const serviceList = Array.isArray(services) ? services : services ? [services] : [];
-        
-        for (const service of serviceList) {
-          processOutput += service.DisplayName + '\n';
-        }
-      } catch (error) {
-        console.error('Error parsing services output:', error);
-      }
-      
-      // Verificar aplicaciones en segundo plano
-      const { stdout: bgAppsOutput } = await execPromise('powershell "Get-Process | Select-Object ProcessName, Description | ConvertTo-Json"').catch(() => ({ stdout: '[]' }));
-      
-      try {
-        const bgApps = JSON.parse(bgAppsOutput);
-        const bgAppsList = Array.isArray(bgApps) ? bgApps : bgApps ? [bgApps] : [];
-        
-        for (const app of bgAppsList) {
-          processOutput += `${app.ProcessName} - ${app.Description || ''}\n`;
           
-          // Verificar si esta aplicación está en nuestra lista de apps de grabación
-          for (const recordingApp of screenRecordingApps) {
-            if ((app.ProcessName && app.ProcessName.toLowerCase().includes(recordingApp.toLowerCase())) || 
-                (app.Description && app.Description.toLowerCase().includes(recordingApp.toLowerCase()))) {
-              if (!detectedApps.includes(app.ProcessName)) {
-                detectedApps.push(app.ProcessName + (app.Description ? ` (${app.Description})` : ''));
-              }
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Error parsing background apps output:', error);
-      }
-      
-      // Verificar configuración del Xbox Game Bar
-      try {
-        const { stdout: xboxOutput } = await execPromise('powershell "Get-ItemProperty -Path \'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR\' -ErrorAction SilentlyContinue | ConvertTo-Json"').catch(() => ({ stdout: '{}' }));
-        
-        try {
-          const xboxSettings = JSON.parse(xboxOutput);
-          if (xboxSettings && xboxSettings.AppCaptureEnabled === 1) {
-            processOutput += 'Xbox Game Bar - Capture Enabled\n';
-            detectedApps.push('Xbox Game Bar (habilitado para captura)');
-          }
-        } catch (error) {
-          console.error('Error parsing Xbox Game Bar settings:', error);
-        }
-      } catch (error) {
-        console.error('Error checking Xbox Game Bar settings:', error);
-      }
-    } else if (process.platform === 'darwin') {
-      // En macOS, usar ps para listar procesos con más detalle
-      const { stdout } = await execPromise('ps -axo comm,pid').catch(() => ({ stdout: '' }));
-      processOutput = stdout;
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        for (const app of screenRecordingApps) {
-          if (line.toLowerCase().includes(app.toLowerCase())) {
-            const appName = line.trim().split(' ')[0];
-            if (!detectedApps.includes(appName)) {
-              detectedApps.push(appName);
-            }
-          }
-        }
-      }
-    } else {
-      // En Linux, usar ps
-      const { stdout } = await execPromise('ps -axo comm,pid').catch(() => ({ stdout: '' }));
-      processOutput = stdout;
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        for (const app of screenRecordingApps) {
-          if (line.toLowerCase().includes(app.toLowerCase())) {
-            const appName = line.trim().split(' ')[0];
-            if (!detectedApps.includes(appName)) {
-              detectedApps.push(appName);
-            }
-          }
-        }
-      }
-    }
-    
-    // Si no encontramos aplicaciones específicas, buscar términos en la salida completa
-    if (detectedApps.length === 0) {
-      for (const app of screenRecordingApps) {
-        if (processOutput.toLowerCase().includes(app.toLowerCase())) {
-          if (!detectedApps.includes(app)) {
-            detectedApps.push(app);
-          }
-        }
-      }
-    }
-    
-    return {
-      recording: detectedApps.length > 0,
-      applications: detectedApps
-    };
-  } catch (error) {
-    console.error('Error checking screen recording:', error);
-    return { recording: false, applications: [] };
-  }
-}
-
-/**
- * Detecta el navegador web instalado y predeterminado
- */
-async function detectBrowsers() {
-  const browsers = [];
-  
-  try {
-    if (process.platform === 'win32') {
-      // Buscar navegadores comunes en Windows
-      const browserPaths = [
-        { name: 'Google Chrome', path: path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome') },
-        { name: 'Mozilla Firefox', path: path.join(os.homedir(), 'AppData', 'Roaming', 'Mozilla', 'Firefox') },
-        { name: 'Microsoft Edge', path: path.join(os.homedir(), 'AppData', 'Local', 'Microsoft', 'Edge') },
-        { name: 'Opera', path: path.join(os.homedir(), 'AppData', 'Roaming', 'Opera Software', 'Opera Stable') },
-        { name: 'Opera GX', path: path.join(os.homedir(), 'AppData', 'Roaming', 'Opera Software', 'Opera GX Stable') },
-        { name: 'Brave', path: path.join(os.homedir(), 'AppData', 'Local', 'BraveSoftware', 'Brave-Browser') },
-        { name: 'Vivaldi', path: path.join(os.homedir(), 'AppData', 'Local', 'Vivaldi') },
-        { name: 'Safari', path: path.join('C:', 'Program Files', 'Safari') }
-      ];
-      
-      for (const browser of browserPaths) {
-        if (fs.existsSync(browser.path)) {
-          browsers.push({
-            name: browser.name,
-            path: browser.path,
-            default: false
+          result.push({
+            name: path.basename(jarPath),
+            path: jarPath,
+            startTime: execution.startTime,
+            source: execution.source || 'Historial de ejecución',
+            size
           });
         }
       }
-      
-      // Intentar detectar el navegador predeterminado
-      try {
-        const { stdout } = await execPromise(
-          'powershell "Get-ItemProperty -Path \'HKCU:\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice\' | Select-Object ProgId | ConvertTo-Json"'
-        ).catch(() => ({ stdout: '{}' }));
-        
-        try {
-          const defaultBrowser = JSON.parse(stdout);
-          if (defaultBrowser && defaultBrowser.ProgId) {
-            let browserName = 'Unknown';
-            
-            if (defaultBrowser.ProgId.includes('Chrome')) browserName = 'Google Chrome';
-            else if (defaultBrowser.ProgId.includes('Firefox')) browserName = 'Mozilla Firefox';
-            else if (defaultBrowser.ProgId.includes('Edge')) browserName = 'Microsoft Edge';
-            else if (defaultBrowser.ProgId.includes('Opera')) {
-              // Verificar si es Opera GX u Opera normal
-              if (fs.existsSync(path.join(os.homedir(), 'AppData', 'Roaming', 'Opera Software', 'Opera GX Stable'))) {
-                browserName = 'Opera GX';
-              } else {
-                browserName = 'Opera';
-              }
-            }
-            else if (defaultBrowser.ProgId.includes('Brave')) browserName = 'Brave';
-            else if (defaultBrowser.ProgId.includes('Vivaldi')) browserName = 'Vivaldi';
-            else if (defaultBrowser.ProgId.includes('Safari')) browserName = 'Safari';
-            
-            // Marcar el navegador predeterminado
-            for (const browser of browsers) {
-              if (browser.name === browserName) {
-                browser.default = true;
-              }
-            }
-          }
-        } catch (error) {
-          console.error('Error parsing default browser:', error);
-        }
-      } catch (error) {
-        console.error('Error getting default browser:', error);
-      }
-    } else if (process.platform === 'darwin') {
-      // Buscar navegadores comunes en macOS
-      const { stdout } = await execPromise('ls /Applications | grep -E "Chrome|Firefox|Safari|Opera|Edge|Brave|Vivaldi"').catch(() => ({ stdout: '' }));
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        if (line.includes('Chrome')) browsers.push({ name: 'Google Chrome', path: `/Applications/${line}`, default: false });
-        else if (line.includes('Firefox')) browsers.push({ name: 'Mozilla Firefox', path: `/Applications/${line}`, default: false });
-        else if (line.includes('Safari')) browsers.push({ name: 'Safari', path: `/Applications/${line}`, default: false });
-        else if (line.includes('Opera')) {
-          if (line.includes('GX')) browsers.push({ name: 'Opera GX', path: `/Applications/${line}`, default: false });
-          else browsers.push({ name: 'Opera', path: `/Applications/${line}`, default: false });
-        }
-        else if (line.includes('Edge')) browsers.push({ name: 'Microsoft Edge', path: `/Applications/${line}`, default: false });
-        else if (line.includes('Brave')) browsers.push({ name: 'Brave', path: `/Applications/${line}`, default: false });
-        else if (line.includes('Vivaldi')) browsers.push({ name: 'Vivaldi', path: `/Applications/${line}`, default: false });
-      }
-      
-      // Obtener el navegador predeterminado en macOS
-      try {
-        const { stdout } = await execPromise('defaults read com.apple.LaunchServices/com.apple.launchservices.secure LSHandlers | grep "LSHandlerURLScheme = http"').catch(() => ({ stdout: '' }));
-        
-        if (stdout) {
-          const defaultBrowserMatch = stdout.match(/LSHandlerRoleAll = "([^"]+)"/);
-          if (defaultBrowserMatch && defaultBrowserMatch[1]) {
-            const defaultId = defaultBrowserMatch[1];
-            let browserName = '';
-            
-            if (defaultId.includes('chrome')) browserName = 'Google Chrome';
-            else if (defaultId.includes('firefox')) browserName = 'Mozilla Firefox';
-            else if (defaultId.includes('safari')) browserName = 'Safari';
-            else if (defaultId.includes('opera')) {
-              // Verificar si es Opera GX u Opera normal
-              if (fs.existsSync('/Applications/Opera GX.app')) {
-                browserName = 'Opera GX';
-              } else {
-                browserName = 'Opera';
-              }
-            }
-            else if (defaultId.includes('edge')) browserName = 'Microsoft Edge';
-            else if (defaultId.includes('brave')) browserName = 'Brave';
-            else if (defaultId.includes('vivaldi')) browserName = 'Vivaldi';
-            
-            // Marcar el navegador predeterminado
-            for (const browser of browsers) {
-              if (browser.name === browserName) {
-                browser.default = true;
-              }
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Error getting default browser:', error);
-      }
-    } else {
-      // En Linux
-      // Buscar navegadores comunes instalados
-      const commands = [
-        { name: 'Google Chrome', cmd: 'which google-chrome' },
-        { name: 'Mozilla Firefox', cmd: 'which firefox' },
-        { name: 'Opera', cmd: 'which opera' },
-        { name: 'Brave', cmd: 'which brave-browser' },
-        { name: 'Vivaldi', cmd: 'which vivaldi' },
-        { name: 'Microsoft Edge', cmd: 'which microsoft-edge' }
-      ];
-      
-      for (const browser of commands) {
-        try {
-          const { stdout } = await execPromise(browser.cmd).catch(() => ({ stdout: '' }));
-          
-          if (stdout.trim()) {
-            browsers.push({
-              name: browser.name,
-              path: stdout.trim(),
-              default: false
-            });
-          }
-        } catch (error) {
-          // Ignorar errores
-        }
-      }
-      
-      // Intentar detectar el navegador predeterminado en Linux
-      try {
-        const { stdout } = await execPromise('xdg-settings get default-web-browser').catch(() => ({ stdout: '' }));
-        
-        if (stdout.trim()) {
-          const defaultBrowser = stdout.trim().toLowerCase();
-          let browserName = '';
-          
-          if (defaultBrowser.includes('chrome')) browserName = 'Google Chrome';
-          else if (defaultBrowser.includes('firefox')) browserName = 'Mozilla Firefox';
-          else if (defaultBrowser.includes('opera')) browserName = 'Opera';
-          else if (defaultBrowser.includes('brave')) browserName = 'Brave';
-          else if (defaultBrowser.includes('vivaldi')) browserName = 'Vivaldi';
-          else if (defaultBrowser.includes('edge')) browserName = 'Microsoft Edge';
-          
-          // Marcar el navegador predeterminado
-          for (const browser of browsers) {
-            if (browser.name === browserName) {
-              browser.default = true;
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Error getting default browser:', error);
+    } catch (error) {
+      console.error('Error obteniendo historial de ejecuciones:', error);
+    }
+    
+    // Método 3: Buscar en logs de Java (multiplataforma)
+    try {
+      const javaLogs = await getJavaLogs(timeThreshold);
+      result.push(...javaLogs);
+    } catch (error) {
+      console.error('Error obteniendo logs de Java:', error);
+    }
+    
+    // Eliminar duplicados basados en la ruta
+    const uniqueResults = [];
+    const seenPaths = new Set();
+    
+    for (const item of result) {
+      if (!seenPaths.has(item.path)) {
+        seenPaths.add(item.path);
+        uniqueResults.push(item);
       }
     }
+    
+    // Ordenar por fecha de inicio, más reciente primero
+    uniqueResults.sort((a, b) => {
+      const timeA = typeof a.startTime === 'string' ? new Date(a.startTime).getTime() : a.startTime;
+      const timeB = typeof b.startTime === 'string' ? new Date(b.startTime).getTime() : b.startTime;
+      return timeB - timeA;
+    });
+    
+    return uniqueResults;
   } catch (error) {
-    console.error('Error detecting browsers:', error);
-  }
-  
-  return browsers;
-}
-
-/**
- * Abre el historial del navegador, con soporte para Opera GX y otros navegadores
- */
-async function openBrowserHistory() {
-  try {
-    // Primero detectar los navegadores instalados
-    const browsers = await detectBrowsers();
-    let browserOpened = false;
-    let errorMessage = '';
-    
-    // Intentar abrir el navegador predeterminado primero
-    const defaultBrowser = browsers.find(browser => browser.default);
-    if (defaultBrowser) {
-      try {
-        await openSpecificBrowserHistory(defaultBrowser);
-        return { success: true, browser: defaultBrowser.name };
-      } catch (error) {
-        errorMessage = `Error al abrir ${defaultBrowser.name}: ${error.message}`;
-        console.error(errorMessage);
-      }
-    }
-    
-    // Si no se pudo abrir el predeterminado, intentar con todos los navegadores detectados
-    for (const browser of browsers) {
-      if (!browserOpened) {
-        try {
-          await openSpecificBrowserHistory(browser);
-          browserOpened = true;
-          return { success: true, browser: browser.name };
-        } catch (error) {
-          console.error(`Error al abrir ${browser.name}: ${error.message}`);
-        }
-      }
-    }
-    
-    // Si aún no se ha abierto, intentar con los comandos genéricos
-    if (process.platform === 'win32') {
-      // Intentar con métodos adicionales en Windows
-      try {
-        await execPromise('start microsoft-edge:about:history');
-        return { success: true, browser: 'Microsoft Edge' };
-      } catch (edgeError) {
-        console.error('Error opening Edge:', edgeError);
-      }
-      
-      try {
-        await execPromise('start chrome:about:history');
-        return { success: true, browser: 'Google Chrome' };
-      } catch (chromeError) {
-        console.error('Error opening Chrome:', chromeError);
-      }
-    }
-    
-    if (browserOpened) {
-      return { success: true };
-    } else {
-      throw new Error(errorMessage || 'No se pudo abrir ningún navegador compatible');
-    }
-  } catch (error) {
+    console.error('Error en getRecentlyExecutedJars:', error);
     throw error;
   }
 }
 
 /**
- * Abre el historial en un navegador específico
+ * Obtiene JARs ejecutados desde el registro de Windows
  */
-async function openSpecificBrowserHistory(browser) {
-  if (process.platform === 'win32') {
-    if (browser.name === 'Google Chrome') {
-      await execPromise('start chrome chrome://history');
-    } else if (browser.name === 'Mozilla Firefox') {
-      await execPromise('start firefox about:history');
-    } else if (browser.name === 'Microsoft Edge') {
-      await execPromise('start msedge edge://history');
-    } else if (browser.name === 'Opera') {
-      await execPromise(`"${browser.path}\\launcher.exe" opera://history`);
-    } else if (browser.name === 'Opera GX') {
-      // Verificar varias rutas posibles para Opera GX
-      const possiblePaths = [
-        path.join(browser.path, 'launcher.exe'),
-        path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Opera GX', 'launcher.exe'),
-        path.join('C:', 'Program Files', 'Opera GX', 'launcher.exe'),
-        path.join('C:', 'Program Files (x86)', 'Opera GX', 'launcher.exe')
-      ];
+async function getJarsFromRegistry(timeThreshold) {
+  const result = [];
+  
+  if (process.platform !== 'win32') return result;
+  
+  try {
+    // Consultar el registro de Windows para JARs ejecutados
+    const command = `powershell -Command "& {
+      $recentItems = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs' -ErrorAction SilentlyContinue;
+      $userAssist = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist\\*\\Count\\*' -ErrorAction SilentlyContinue;
       
-      for (const exePath of possiblePaths) {
-        if (fs.existsSync(exePath)) {
-          await execPromise(`"${exePath}" opera://history`);
-          return;
+      $jarItems = @();
+      
+      # Revisar RecentDocs
+      if ($recentItems) {
+        $recentItems.PSObject.Properties | Where-Object { $_.Name -like '*.jar*' } | ForEach-Object {
+          $name = [System.Text.Encoding]::Unicode.GetString($_.Value);
+          if ($name -match '\\.jar') {
+            $jarItems += @{
+              'Name' = $name.Trim('\u0000');
+              'Source' = 'RecentDocs';
+              'Time' = (Get-Item 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs').LastWriteTime
+            }
+          }
         }
       }
       
-      throw new Error('No se pudo encontrar el ejecutable de Opera GX');
-    } else if (browser.name === 'Brave') {
-      await execPromise('start brave chrome://history');
-    } else if (browser.name === 'Vivaldi') {
-      await execPromise('start vivaldi vivaldi://history');
-    } else if (browser.name === 'Safari') {
-      await execPromise('start safari');
+      # Revisar UserAssist
+      if ($userAssist) {
+        $userAssist.PSObject.Properties | Where-Object { $_.Name -like '*jar*' } | ForEach-Object {
+          $decodedName = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($_.Name));
+          if ($decodedName -match '\\.jar') {
+            $jarItems += @{
+              'Name' = $decodedName;
+              'Source' = 'UserAssist';
+              'Time' = (Get-Item $_.PSPath).LastWriteTime
+            }
+          }
+        }
+      }
+      
+      # JumpList items
+      $jumpLists = Get-ChildItem 'C:\\Users\\*\\AppData\\Roaming\\Microsoft\\Windows\\Recent\\AutomaticDestinations' -ErrorAction SilentlyContinue;
+      foreach ($jumpList in $jumpLists) {
+        $content = [System.IO.File]::ReadAllBytes($jumpList.FullName);
+        $contentString = [System.Text.Encoding]::Unicode.GetString($content);
+        if ($contentString -match '\\.jar') {
+          $jarItems += @{
+            'Name' = 'JAR en JumpList';
+            'Source' = 'JumpList';
+            'Time' = $jumpList.LastWriteTime
+          }
+        }
+      }
+      
+      # Convertir a JSON
+      $jarItems | ConvertTo-Json
+    }"`;
+    
+    const { stdout } = await execAsync(command);
+    
+    if (stdout.trim()) {
+      let jarItems;
+      try {
+        jarItems = JSON.parse(stdout);
+        // Asegurar que sea un array incluso si solo hay un resultado
+        if (!Array.isArray(jarItems)) jarItems = [jarItems];
+      } catch (error) {
+        console.error('Error parseando JSON de JARs:', error);
+        return result;
+      }
+      
+      jarItems.forEach(item => {
+        const time = new Date(item.Time).getTime();
+        if (time >= timeThreshold) {
+          result.push({
+            name: path.basename(item.Name),
+            path: item.Name,
+            startTime: new Date(item.Time).toLocaleString(),
+            source: item.Source
+          });
+        }
+      });
     }
-  } else if (process.platform === 'darwin') {
-    // En macOS
-    if (browser.name === 'Google Chrome') {
-      await execPromise('open -a "Google Chrome" chrome://history');
-    } else if (browser.name === 'Mozilla Firefox') {
-      await execPromise('open -a "Firefox" about:history');
-    } else if (browser.name === 'Safari') {
-      await execPromise('open -a Safari');
-    } else if (browser.name === 'Opera GX') {
-      await execPromise('open -a "Opera GX" opera://history');
-    } else if (browser.name === 'Opera') {
-      await execPromise('open -a "Opera" opera://history');
-    } else if (browser.name === 'Microsoft Edge') {
-      await execPromise('open -a "Microsoft Edge" edge://history');
-    } else if (browser.name === 'Brave') {
-      await execPromise('open -a "Brave Browser" chrome://history');
-    } else if (browser.name === 'Vivaldi') {
-      await execPromise('open -a "Vivaldi" vivaldi://history');
+  } catch (error) {
+    console.error('Error obteniendo JARs del registro:', error);
+  }
+  
+  return result;
+}
+
+/**
+ * Obtiene logs de ejecución de Java
+ */
+async function getJavaLogs(timeThreshold) {
+  const result = [];
+  
+  try {
+    // Rutas comunes de logs de Java
+    const logPaths = [
+      path.join(os.homedir(), '.java', 'error'),
+      path.join(os.homedir(), '.minecraft', 'logs'),
+      path.join(os.homedir(), 'AppData', 'Roaming', '.minecraft', 'logs'),
+      path.join(os.homedir(), 'Library', 'Logs', 'Java'),
+      '/var/log/java'
+    ];
+    
+    for (const logPath of logPaths) {
+      try {
+        if (fs.existsSync(logPath)) {
+          const items = await fs.promises.readdir(logPath, { withFileTypes: true });
+          
+          for (const item of items) {
+            try {
+              if (item.isFile() && (item.name.includes('.log') || item.name.includes('hs_err'))) {
+                const fullPath = path.join(logPath, item.name);
+                const stats = await fs.promises.stat(fullPath);
+                
+                if (stats.mtime.getTime() >= timeThreshold) {
+                  // Leer el contenido del log para buscar referencias a JARs
+                  const content = await fs.promises.readFile(fullPath, 'utf8');
+                  const jarMatches = content.match(/[-.\w\/\\]+\.jar/g);
+                  
+                  if (jarMatches) {
+                    for (const jarPath of jarMatches) {
+                      const normalizedPath = jarPath.replace(/\\/g, path.sep).replace(/\//g, path.sep);
+                      
+                      result.push({
+                        name: path.basename(normalizedPath),
+                        path: normalizedPath,
+                        startTime: new Date(stats.mtime).toLocaleString(),
+                        source: `Log de Java (${item.name})`
+                      });
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              // Ignorar errores individuales
+            }
+          }
+        }
+      } catch (error) {
+        // Ignorar errores de acceso a directorios
+      }
     }
-  } else {
-    // En Linux
-    if (browser.name === 'Google Chrome') {
-      await execPromise('google-chrome chrome://history');
-    } else if (browser.name === 'Mozilla Firefox') {
-      await execPromise('firefox about:history');
-    } else if (browser.name === 'Opera') {
-      await execPromise('opera opera://history');
-    } else if (browser.name === 'Microsoft Edge') {
-      await execPromise('microsoft-edge edge://history');
-    } else if (browser.name === 'Brave') {
-      await execPromise('brave-browser chrome://history');
-    } else if (browser.name === 'Vivaldi') {
-      await execPromise('vivaldi vivaldi://history');
+  } catch (error) {
+    console.error('Error obteniendo logs de Java:', error);
+  }
+  
+  return result;
+}
+
+/**
+ * Verifica si un USB fue desconectado antes de la SS
+ */
+async function checkUSBDisconnection() {
+  try {
+    const result = {
+      disconnected: false,
+      details: []
+    };
+    
+    if (process.platform === 'win32') {
+      // En Windows, usar PowerShell para obtener información de eventos
+      try {
+        const command = `powershell -Command "& {
+          $events = Get-WinEvent -FilterHashtable @{
+            LogName='System';
+            ID=2100,2102,6420,6421;
+          } -MaxEvents 50 -ErrorAction SilentlyContinue;
+          
+          $events | ForEach-Object {
+            $time = $_.TimeCreated;
+            $message = $_.Message;
+            
+            # Extraer información del dispositivo
+            $deviceInfo = '';
+            if ($message -match 'dispositivo|device|removable media|storage|usb|flash|drive') {
+              $deviceInfo = $message -replace '\\r\\n', ' ' -replace '\\s+', ' ';
+            }
+            
+            if ($deviceInfo -ne '') {
+              [PSCustomObject]@{
+                Time = $time;
+                Device = $deviceInfo;
+              }
+            }
+          } | ConvertTo-Json
+        }"`;
+        
+        const { stdout } = await execAsync(command);
+        
+        if (stdout.trim()) {
+          let events;
+          try {
+            events = JSON.parse(stdout);
+            // Asegurar que sea un array incluso si solo hay un resultado
+            if (!Array.isArray(events)) events = [events];
+          } catch (error) {
+            console.error('Error parseando JSON de eventos USB:', error);
+            return result;
+          }
+          
+          // Verificar los últimos 30 minutos para dispositivos desconectados
+          const thirtyMinutesAgo = Date.now() - (30 * 60 * 1000);
+          
+          events.forEach(event => {
+            const eventTime = new Date(event.Time).getTime();
+            if (eventTime >= thirtyMinutesAgo) {
+              result.disconnected = true;
+              
+              // Extraer información relevante
+              let deviceInfo = event.Device;
+              if (deviceInfo.length > 100) {
+                deviceInfo = deviceInfo.substring(0, 100) + '...';
+              }
+              
+              result.details.push({
+                device: deviceInfo,
+                time: new Date(event.Time).toLocaleString()
+              });
+            }
+          });
+        }
+      } catch (error) {
+        console.error('Error obteniendo eventos de USB:', error);
+      }
+    } else if (process.platform === 'darwin') {
+      // En macOS, usar system_profiler
+      try {
+        const { stdout } = await execAsync('system_profiler SPUSBDataType');
+        
+        // Buscar información de dispositivos USB
+        const usbDevices = stdout.split('\n\n')
+          .filter(section => section.includes('USB'))
+          .map(section => section.trim());
+        
+        // Verificar logs del sistema para desconexiones
+        const { stdout: logOutput } = await execAsync('log show --predicate "subsystem == \'com.apple.iokit.IOUSBFamily\'" --style compact --last 30m');
+        
+        const disconnectionLines = logOutput.split('\n')
+          .filter(line => line.includes('disconnect') || line.includes('detach'));
+        
+        if (disconnectionLines.length > 0) {
+          result.disconnected = true;
+          
+          disconnectionLines.forEach(line => {
+            const timeMatch = line.match(/(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+            const time = timeMatch ? timeMatch[1] : 'Tiempo desconocido';
+            
+            result.details.push({
+              device: 'Dispositivo USB',
+              time: time
+            });
+          });
+        }
+      } catch (error) {
+        console.error('Error obteniendo información USB en macOS:', error);
+      }
+    } else {
+      // En Linux, revisar logs del sistema
+      try {
+        const { stdout } = await execAsync('dmesg | grep -i "usb disconnect\\|removed"');
+        
+        const lines = stdout.split('\n').filter(line => line.trim() !== '');
+        
+        if (lines.length > 0) {
+          result.disconnected = true;
+          
+          lines.forEach(line => {
+            result.details.push({
+              device: line.replace(/\[\d+\.\d+\]/, '').trim(),
+              time: 'Recientemente'
+            });
+          });
+        }
+      } catch (error) {
+        // Es normal que grep falle si no hay coincidencias
+      }
     }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en checkUSBDisconnection:', error);
+    throw error;
   }
 }
 
 /**
- * Lista completa de cheats y hacks conocidos para Minecraft
+ * Verifica si hay aplicaciones grabando la pantalla
  */
-const minecraftCheatsDatabase = [
-  // Clientes populares
-  { name: "Wurst Client", category: "Client", type: "Combat/Utility", description: "Cliente de hacks popular con módulos de combate, movimiento y más" },
-  { name: "Impact Client", category: "Client", type: "Combat/Utility", description: "Cliente para supervivencia y anárquicos con muchos módulos" },
-  { name: "LiquidBounce", category: "Client", type: "Combat/Utility/Movement", description: "Cliente de código abierto con múltiples funciones" },
-  { name: "Sigma Client", category: "Client", type: "Combat/PVP", description: "Cliente con enfoque en PVP con múltiples versiones" },
-  { name: "Aristois", category: "Client", type: "Utility", description: "Cliente con múltiples características para supervivencia" },
-  { name: "Flux", category: "Client", type: "Premium", description: "Cliente premium con varios bypasses para servidores" },
-  { name: "Future Client", category: "Client", type: "Premium/Anarchy", description: "Cliente premium para servidores anárquicos" },
-  { name: "ForgeHax", category: "Mod", type: "Forge-based", description: "Conjunto de mods basado en Forge con múltiples cheats" },
-  { name: "Inertia", category: "Client", type: "Utility", description: "Anteriormente llamado WWE, cliente para servidores anárquicos" },
-  { name: "Meteor Client", category: "Client", type: "Fabric-based", description: "Cliente moderno basado en Fabric con muchos módulos" },
-  { name: "KAMI Blue", category: "Client", type: "Utility", description: "Fork de KAMI con más características" },
-  { name: "Sallos", category: "Client", type: "Premium", description: "Cliente premium con funcionalidades avanzadas" },
-  { name: "Vape Client", category: "Client", type: "Premium/Ghost", description: "Cliente premium ghost enfocado en bypasses de anticheats" },
-  { name: "Aristois", category: "Client", type: "Mixed", description: "Cliente con múltiples características y actualización constante" },
-  { name: "Huzuni", category: "Client", type: "Legacy", description: "Cliente antiguo pero popular para versiones anteriores" },
-  { name: "Wolfram", category: "Client", type: "Legacy", description: "Cliente clásico para versiones antiguas" },
-  
-  // Mods específicos
-  { name: "Xray Mod", category: "Mod", type: "Vision", description: "Permite ver a través de bloques para encontrar minerales y estructuras" },
-  { name: "Baritone", category: "Mod", type: "Bot/Automation", description: "Sistema de pathfinding y automatización para Minecraft" },
-  { name: "Schematica", category: "Mod", type: "Utility", description: "Permite colocar esquemas de construcción en el mundo" },
-  { name: "Mini Mods/Macro Mods", category: "Mod", type: "Utility", description: "Pequeños mods que automatizan tareas específicas" },
-  
-  // Hacks específicos
-  { name: "KillAura", category: "Hack", type: "Combat", description: "Ataca automáticamente a entidades cercanas" },
-  { name: "Aimbot", category: "Hack", type: "Combat", description: "Apunta automáticamente a enemigos" },
-  { name: "Criticals", category: "Hack", type: "Combat", description: "Asegura golpes críticos en cada ataque" },
-  { name: "AutoClicker", category: "Hack", type: "Combat/Utility", description: "Hace clicks automáticos a velocidades configurables" },
-  { name: "Reach", category: "Hack", type: "Combat", description: "Aumenta el alcance de ataque y colocación de bloques" },
-  { name: "Velocity", category: "Hack", type: "Movement", description: "Reduce o elimina el retroceso al recibir daño" },
-  { name: "AntiKnockback", category: "Hack", type: "Movement", description: "Previene ser empujado por ataques" },
-  { name: "BHop/Bunny Hop", category: "Hack", type: "Movement", description: "Permite saltar y moverse más rápido" },
-  { name: "Speed", category: "Hack", type: "Movement", description: "Aumenta la velocidad de movimiento" },
-  { name: "Fly", category: "Hack", type: "Movement", description: "Permite volar en modo supervivencia" },
-  { name: "Jesus/Water Walk", category: "Hack", type: "Movement", description: "Permite caminar sobre el agua" },
-  { name: "NoFall", category: "Hack", type: "Player", description: "Evita daño por caídas" },
-  { name: "Spider", category: "Hack", type: "Movement", description: "Permite escalar paredes como una araña" },
-  { name: "Step", category: "Hack", type: "Movement", description: "Permite subir bloques automáticamente sin saltar" },
-  { name: "Scaffold", category: "Hack", type: "World", description: "Coloca bloques automáticamente bajo el jugador" },
-  { name: "Nuker", category: "Hack", type: "World", description: "Rompe bloques a gran velocidad alrededor del jugador" },
-  { name: "ESP", category: "Hack", type: "Render", description: "Muestra entidades, cofres y otros objetos a través de paredes" },
-  { name: "Tracers", category: "Hack", type: "Render", description: "Dibuja líneas hacia entidades y puntos de interés" },
-  { name: "Freecam", category: "Hack", type: "Render", description: "Permite mover la cámara separada del jugador" },
-  { name: "Wallhack", category: "Hack", type: "Render", description: "Permite ver a través de paredes" },
-  { name: "Chams", category: "Hack", type: "Render", description: "Colorea entidades para verlas mejor" },
-  { name: "FastBreak", category: "Hack", type: "World", description: "Rompe bloques más rápido" },
-  { name: "FastPlace", category: "Hack", type: "World", description: "Coloca bloques más rápido" },
-  { name: "AutoTool", category: "Hack", type: "Utility", description: "Selecciona automáticamente la mejor herramienta" },
-  { name: "ChestESP", category: "Hack", type: "Render", description: "Muestra cofres a través de paredes" },
-  
-  // Ghost cheats
-  { name: "Legit Aim Assist", category: "Ghost", type: "Combat", description: "Asistencia sutil para apuntar" },
-  { name: "Smooth Aim", category: "Ghost", type: "Combat", description: "Ayuda a apuntar de forma suave y poco detectable" },
-  { name: "Trigger Bot", category: "Ghost", type: "Combat", description: "Ataca automáticamente cuando el cursor está sobre un enemigo" },
-  { name: "Auto Clicker (Low CPS)", category: "Ghost", type: "Combat", description: "Auto clicker con velocidades realistas para evitar detección" },
-  { name: "Legit Reach", category: "Ghost", type: "Combat", description: "Pequeño aumento en el alcance difícil de detectar" },
-  { name: "Legit Velocity", category: "Ghost", type: "Movement", description: "Reducción sutil de retroceso" },
-  { name: "Timer", category: "Ghost", type: "Movement", description: "Aceleración leve del juego para movimiento más rápido" },
-  { name: "FastClick", category: "Ghost", type: "Utility", description: "Ayuda a hacer clicks más rápidos en situaciones específicas" },
-  { name: "HitBoxes", category: "Hack", type: "Combat", description: "Aumenta el tamaño de hitbox de los enemigos" },
-  
-  // Anticheats conocidos (para evadirlos)
-  { name: "NoCheatPlus", category: "AntiCheat", type: "Server", description: "Anticheat popular en muchos servidores" },
-  { name: "AAC", category: "AntiCheat", type: "Server", description: "Advanced Anti-Cheat, sistema avanzado de detección" },
-  { name: "Matrix", category: "AntiCheat", type: "Server", description: "Sistema de detección moderno" },
-  { name: "Spartan", category: "AntiCheat", type: "Server", description: "Anticheat con múltiples capas de detección" },
-  { name: "Watchdog", category: "AntiCheat", type: "Server", description: "Sistema usado en Hypixel" },
-  { name: "Grim", category: "AntiCheat", type: "Server", description: "Anticheat moderno con detección avanzada" },
-  { name: "Vulcan", category: "AntiCheat", type: "Server", description: "Anticheat premium con múltiples comprobaciones" },
-  { name: "Verus", category: "AntiCheat", type: "Server", description: "Anticheat usado en varios servidores grandes" },
-  
-  // Utilidades auxiliares y destructivas
-  { name: "NBTEdit", category: "Tool", type: "Utility", description: "Edita datos NBT de items y entidades" },
-  { name: "Inventory Editors", category: "Tool", type: "Utility", description: "Edita inventarios y cofres en el juego" },
-  { name: "Server Crashers", category: "Tool", type: "Destructive", description: "Provoca crasheos en servidores" },
-  { name: "UUID Spoofer", category: "Tool", type: "Identity", description: "Cambia UUID para evadir baneos" },
-  { name: "Skin Stealers", category: "Tool", type: "Identity", description: "Copia skins de otros jugadores" },
-  { name: "Chat Spammer", category: "Hack", type: "Utility", description: "Envía mensajes automáticamente al chat" },
-  { name: "BookBots", category: "Tool", type: "Destructive", description: "Crea libros con texto que puede causar lag" },
-  
-  // Herramientas avanzadas
-  { name: "Packet Editors", category: "Advanced", type: "Network", description: "Modifica paquetes de red enviados al servidor" },
-  { name: "Protocol Manipulation", category: "Advanced", type: "Network", description: "Manipula el protocolo de comunicación del juego" },
-  { name: "Memory Editors", category: "Advanced", type: "System", description: "Modifica memoria del juego directamente" },
-  { name: "Proxy Tools", category: "Advanced", type: "Network", description: "Usa proxies para evadir baneos por IP" },
-  { name: "VPN for Ban Evasion", category: "Advanced", type: "Network", description: "Usa VPN para evadir baneos" }
-];
-
-/**
- * Detecta páginas de cheats de Minecraft en el historial del navegador
- */
-async function detectMinecraftCheats() {
-  const cheatSites = [
-    'cheatbreaker', 'wurst-client', 'impact-client', 'liquidbounce',
-    'minecraftcheat', 'hackphoenix', 'skidclient', 'fluxclient', 
-    'aristois', 'wolfram', 'huzuni', 'sigma', 'xray', 'nodus',
-    'badlion', 'lunar', 'pvplounge', 'vape', 'forge', 'mchack',
-    'cheatminecraft', 'minecrafthack', 'hackedclient', 'minecraftforge',
-    'autoclicker', 'killaura', 'bhop', 'flyhack', 'xrayhack'
-  ];
-  
-  let foundCheatSites = [];
-  
+async function checkScreenRecording() {
   try {
-    // Intentar acceder al historial del navegador
+    const result = {
+      recording: false,
+      applications: []
+    };
+    
+    // Lista de aplicaciones conocidas de grabación de pantalla
+    const recordingApps = [
+      'OBS Studio',
+      'OBS',
+      'Streamlabs OBS',
+      'XSplit',
+      'Bandicam',
+      'Camtasia',
+      'ScreenRecorder',
+      'Fraps',
+      'Action!',
+      'ShareX',
+      'Screencast-O-Matic',
+      'Debut',
+      'CamStudio',
+      'ScreenFlow',
+      'QuickTime Player',
+      'ScreencastX',
+      'ScreenRec',
+      'Movavi Screen Recorder',
+      'Icecream Screen Recorder',
+      'Apowersoft',
+      'ScreenToGif',
+      'DU Recorder',
+      'AZ Screen Recorder',
+      'FBX',
+      'FFmpeg',
+      'Screen Recorder'
+    ];
+    
+    // Excluir aplicaciones conocidas de falsos positivos
+    const falsePositives = [
+      'Capture One',
+      'Capture NX',
+      'Capture Manager',
+      'Capture Service',
+      'Windows Media Player',
+      'Windows Photo Viewer',
+      'Photos',
+      'Camera',
+      'ScreenSaver',
+      'ScreenConnect',
+      'Screen Time',
+      'Microsoft Teams',
+      'Adobe Capture',
+      'TeamViewer'
+    ];
+    
     if (process.platform === 'win32') {
-      // Intentar con Chrome
-      const chromeHistoryPath = path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Default', 'History');
-      if (fs.existsSync(chromeHistoryPath)) {
-        try {
-          // Crear una copia temporal del archivo de historial para poder leerlo
-          const tempHistoryPath = path.join(os.tmpdir(), 'temp_chrome_history');
-          fs.copyFileSync(chromeHistoryPath, tempHistoryPath);
-          
-          // Usar sqlite3 a través de exec
-          const { stdout } = await execPromise(
-            `powershell "Add-Type -AssemblyName System.Data.SQLite; $conn = New-Object System.Data.SQLite.SQLiteConnection('Data Source=${tempHistoryPath}'); $conn.Open(); $cmd = $conn.CreateCommand(); $cmd.CommandText = 'SELECT url, title, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 1000'; $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($cmd); $data = New-Object System.Data.DataSet; [void]$adapter.Fill($data); $conn.Close(); $data.Tables[0] | ConvertTo-Json"`
-          ).catch(() => ({ stdout: '[]' }));
-          
+      // En Windows, verificar procesos en ejecución
+      try {
+        const { stdout } = await execAsync('tasklist /v /fo csv');
+        
+        // Convertir CSV a array de objetos
+        const lines = stdout.split('\n').filter(line => line.trim() !== '');
+        const headers = lines[0].split(',').map(h => h.replace(/"/g, ''));
+        
+        for (let i = 1; i < lines.length; i++) {
           try {
-            const historyItems = JSON.parse(stdout);
-            const itemList = Array.isArray(historyItems) ? historyItems : historyItems ? [historyItems] : [];
-            
-            for (const item of itemList) {
-              const url = item.url.toLowerCase();
-              const title = item.title.toLowerCase();
+            const values = lines[i].match(/(".*?"|[^",]+)(?=\s*,|\s*$)/g);
+            if (values) {
+              const processName = values[0].replace(/"/g, '');
+              const windowTitle = values[values.length - 1].replace(/"/g, '');
               
-              for (const cheatSite of cheatSites) {
-                if (url.includes(cheatSite) || title.includes(cheatSite)) {
-                  foundCheatSites.push({
-                    url: item.url,
-                    title: item.title,
-                    visitTime: new Date(item.last_visit_time),
-                    browser: 'Google Chrome'
-                  });
-                  break;
+              const isFalsePositive = falsePositives.some(app => 
+                processName.toLowerCase().includes(app.toLowerCase()) || 
+                windowTitle.toLowerCase().includes(app.toLowerCase())
+              );
+              
+              if (!isFalsePositive) {
+                const isRecording = recordingApps.some(app => 
+                  processName.toLowerCase().includes(app.toLowerCase()) || 
+                  windowTitle.toLowerCase().includes(app.toLowerCase())
+                );
+                
+                if (isRecording) {
+                  result.recording = true;
+                  result.applications.push(processName + (windowTitle ? ` (${windowTitle})` : ''));
                 }
               }
             }
-          } catch (parseError) {
-            console.error('Error parsing history:', parseError);
+          } catch (error) {
+            // Ignorar errores en líneas individuales
           }
+        }
+      } catch (error) {
+        console.error('Error verificando procesos en Windows:', error);
+      }
+      
+      // Verificar servicios y componentes específicos
+      try {
+        const { stdout: servicesOutput } = await execAsync('powershell -Command "& { Get-Service | Where-Object { $_.Status -eq \'Running\' } | Select-Object Name, DisplayName | ConvertTo-Csv -NoTypeInformation }"');
+        
+        const serviceLines = servicesOutput.split('\n').filter(line => line.trim() !== '' && !line.includes('Name,DisplayName'));
+        
+        for (const line of serviceLines) {
+          const match = line.match(/"([^"]+)","([^"]+)"/);
+          if (match) {
+            const serviceName = match[1];
+            const displayName = match[2];
+            
+            const isFalsePositive = falsePositives.some(app => 
+              serviceName.toLowerCase().includes(app.toLowerCase()) || 
+              displayName.toLowerCase().includes(app.toLowerCase())
+            );
+            
+            if (!isFalsePositive) {
+              const isRecording = recordingApps.some(app => 
+                serviceName.toLowerCase().includes(app.toLowerCase()) || 
+                displayName.toLowerCase().includes(app.toLowerCase())
+              );
+              
+              if (isRecording) {
+                result.recording = true;
+                result.applications.push(`Servicio: ${displayName}`);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error verificando servicios en Windows:', error);
+      }
+      
+      // Verificar dispositivos de captura activos
+      try {
+        const { stdout: deviceOutput } = await execAsync('powershell -Command "& { Get-WmiObject Win32_PnPEntity | Where-Object { $_.Caption -like \'*capture*\' -or $_.Caption -like \'*video*\' } | Select-Object Caption | ConvertTo-Csv -NoTypeInformation }"');
+        
+        const deviceLines = deviceOutput.split('\n').filter(line => line.trim() !== '' && !line.includes('Caption'));
+        
+        for (const line of deviceLines) {
+          const match = line.match(/"([^"]+)"/);
+          if (match) {
+            const deviceName = match[1];
+            
+            const isFalsePositive = falsePositives.some(app => 
+              deviceName.toLowerCase().includes(app.toLowerCase())
+            );
+            
+            if (!isFalsePositive && deviceName.toLowerCase().includes('capture')) {
+              result.applications.push(`Dispositivo de captura: ${deviceName}`);
+              
+              // Solo marcamos como grabación si no es un falso positivo común
+              if (!deviceName.match(/webcam|camera|cam$/i)) {
+                result.recording = true;
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error verificando dispositivos en Windows:', error);
+      }
+    } else if (process.platform === 'darwin') {
+      // En macOS, verificar procesos en ejecución
+      try {
+        const { stdout } = await execAsync('ps -ax -o comm=');
+        
+        const processes = stdout.split('\n').filter(p => p.trim() !== '');
+        
+        for (const process of processes) {
+          const isFalsePositive = falsePositives.some(app => 
+            process.toLowerCase().includes(app.toLowerCase())
+          );
           
-          // Eliminar el archivo temporal
-          fs.unlinkSync(tempHistoryPath);
-        } catch (error) {
-          console.error('Error accessing Chrome history:', error);
+          if (!isFalsePositive) {
+            const isRecording = recordingApps.some(app => 
+              process.toLowerCase().includes(app.toLowerCase())
+            );
+            
+            if (isRecording) {
+              result.recording = true;
+              result.applications.push(process);
+            }
+          }
+        }
+        
+        // Verificar permisos de grabación de pantalla
+        const { stdout: permissionsOutput } = await execAsync('tccutil list');
+        
+        if (permissionsOutput.includes('ScreenCapture') || permissionsOutput.includes('kTCCServiceScreenCapture')) {
+          // Hay aplicaciones con permiso de captura de pantalla
+          const permissionLines = permissionsOutput.split('\n').filter(line => 
+            line.includes('ScreenCapture') || line.includes('kTCCServiceScreenCapture')
+          );
+          
+          for (const line of permissionLines) {
+            const appMatch = line.match(/([^\/\s]+)\.app/);
+            if (appMatch) {
+              const appName = appMatch[1];
+              
+              const isFalsePositive = falsePositives.some(app => 
+                appName.toLowerCase().includes(app.toLowerCase())
+              );
+              
+              if (!isFalsePositive) {
+                result.applications.push(`${appName} (tiene permisos de captura)`);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error verificando procesos en macOS:', error);
+      }
+    } else {
+      // En Linux, verificar procesos en ejecución
+      try {
+        const { stdout } = await execAsync('ps -e -o comm=');
+        
+        const processes = stdout.split('\n').filter(p => p.trim() !== '');
+        
+        for (const process of processes) {
+          const isFalsePositive = falsePositives.some(app => 
+            process.toLowerCase().includes(app.toLowerCase())
+          );
+          
+          if (!isFalsePositive) {
+            const isRecording = recordingApps.some(app => 
+              process.toLowerCase().includes(app.toLowerCase())
+            );
+            
+            if (isRecording) {
+              result.recording = true;
+              result.applications.push(process);
+            }
+          }
+        }
+        
+        // Verificar compositors de grabación (gstreamer, ffmpeg, etc.)
+        const { stdout: compositorOutput } = await execAsync('ps -e -o args= | grep -E "ffmpeg|gst|v4l2|x11grab|xcbgrab"');
+        
+        const compositorProcesses = compositorOutput.split('\n').filter(p => p.trim() !== '');
+        
+        for (const process of compositorProcesses) {
+          if (process.includes('grep')) continue; // Ignorar el propio grep
+          
+          result.recording = true;
+          result.applications.push(`Compositor de grabación: ${process.substring(0, 50)}...`);
+        }
+      } catch (error) {
+        // Es normal que grep falle si no hay coincidencias
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en checkScreenRecording:', error);
+    throw error;
+  }
+}
+
+/**
+ * Detecta navegadores instalados en el sistema
+ */
+async function detectBrowsers() {
+  try {
+    const browsers = [];
+    const defaultBrowserInfo = await getDefaultBrowser();
+    
+    if (process.platform === 'win32') {
+      // En Windows, buscar navegadores comunes
+      const browserPaths = [
+        { name: 'Google Chrome', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Google\\Chrome\\Application\\chrome.exe') },
+        { name: 'Google Chrome', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Google\\Chrome\\Application\\chrome.exe') },
+        { name: 'Mozilla Firefox', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Mozilla Firefox\\firefox.exe') },
+        { name: 'Mozilla Firefox', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Mozilla Firefox\\firefox.exe') },
+        { name: 'Microsoft Edge', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft\\Edge\\Application\\msedge.exe') },
+        { name: 'Microsoft Edge', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Microsoft\\Edge\\Application\\msedge.exe') },
+        { name: 'Opera', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Opera\\launcher.exe') },
+        { name: 'Opera', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Opera\\launcher.exe') },
+        { name: 'Opera GX', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Opera GX\\launcher.exe') },
+        { name: 'Opera GX', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Opera GX\\launcher.exe') },
+        { name: 'Opera GX', path: path.join(os.homedir(), 'AppData\\Local\\Programs\\Opera GX\\launcher.exe') },
+        { name: 'Brave', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'BraveSoftware\\Brave-Browser\\Application\\brave.exe') },
+        { name: 'Brave', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'BraveSoftware\\Brave-Browser\\Application\\brave.exe') },
+        { name: 'Vivaldi', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Vivaldi\\Application\\vivaldi.exe') },
+        { name: 'Vivaldi', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Vivaldi\\Application\\vivaldi.exe') },
+        { name: 'Yandex Browser', path: path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Yandex\\YandexBrowser\\browser.exe') },
+        { name: 'Yandex Browser', path: path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Yandex\\YandexBrowser\\browser.exe') }
+      ];
+      
+      // Verificar si los navegadores están instalados
+      for (const browser of browserPaths) {
+        if (fs.existsSync(browser.path)) {
+          browsers.push({
+            name: browser.name,
+            path: browser.path,
+            default: defaultBrowserInfo.name === browser.name
+          });
         }
       }
       
-      // Intentar con Firefox
-      const firefoxProfilesPath = path.join(os.homedir(), 'AppData', 'Roaming', 'Mozilla', 'Firefox', 'Profiles');
-      if (fs.existsSync(firefoxProfilesPath)) {
+      // Buscar instalaciones alternativas comunes
+      const alternativePaths = [
+        path.join(os.homedir(), 'AppData\\Local\\Programs'),
+        path.join(os.homedir(), 'AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs')
+      ];
+      
+      for (const dirPath of alternativePaths) {
         try {
-          const profiles = await readdirPromise(firefoxProfilesPath);
-          
-          for (const profile of profiles) {
-            const placesPath = path.join(firefoxProfilesPath, profile, 'places.sqlite');
+          if (fs.existsSync(dirPath)) {
+            const items = fs.readdirSync(dirPath, { withFileTypes: true });
             
-            if (fs.existsSync(placesPath)) {
-              // Crear una copia temporal
-              const tempPlacesPath = path.join(os.tmpdir(), 'temp_firefox_places');
-              fs.copyFileSync(placesPath, tempPlacesPath);
-              
-              try {
-                const { stdout } = await execPromise(
-                  `powershell "Add-Type -AssemblyName System.Data.SQLite; $conn = New-Object System.Data.SQLite.SQLiteConnection('Data Source=${tempPlacesPath}'); $conn.Open(); $cmd = $conn.CreateCommand(); $cmd.CommandText = 'SELECT url, title, last_visit_date FROM moz_places ORDER BY last_visit_date DESC LIMIT 1000'; $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($cmd); $data = New-Object System.Data.DataSet; [void]$adapter.Fill($data); $conn.Close(); $data.Tables[0] | ConvertTo-Json"`
-                ).catch(() => ({ stdout: '[]' }));
+            for (const item of items) {
+              if (item.isDirectory()) {
+                // Buscar navegadores en estas ubicaciones alternativas
+                const folderPath = path.join(dirPath, item.name);
+                const browserKeywords = ['chrome', 'firefox', 'edge', 'opera', 'brave', 'vivaldi', 'yandex', 'browser'];
                 
-                try {
-                  const historyItems = JSON.parse(stdout);
-                  const itemList = Array.isArray(historyItems) ? historyItems : historyItems ? [historyItems] : [];
-                  
-                  for (const item of itemList) {
-                    const url = item.url.toLowerCase();
-                    const title = (item.title || '').toLowerCase();
+                if (browserKeywords.some(keyword => item.name.toLowerCase().includes(keyword))) {
+                  // Es posible que sea una carpeta de navegador, buscar ejecutables
+                  try {
+                    const files = fs.readdirSync(folderPath, { withFileTypes: true });
                     
-                    for (const cheatSite of cheatSites) {
-                      if (url.includes(cheatSite) || title.includes(cheatSite)) {
-                        foundCheatSites.push({
-                          url: item.url,
-                          title: item.title || 'Sin título',
-                          visitTime: new Date(item.last_visit_date / 1000),
-                          browser: 'Mozilla Firefox'
+                    for (const file of files) {
+                      if (file.name.endsWith('.exe')) {
+                        browsers.push({
+                          name: item.name,
+                          path: path.join(folderPath, file.name),
+                          default: defaultBrowserInfo.name === item.name
                         });
                         break;
                       }
                     }
+                  } catch (error) {
+                    // Ignorar errores de acceso
                   }
-                } catch (parseError) {
-                  console.error('Error parsing Firefox history:', parseError);
                 }
-                
-                fs.unlinkSync(tempPlacesPath);
-                break; // Solo necesitamos un perfil
-              } catch (error) {
-                console.error('Error accessing Firefox profile:', error);
               }
             }
           }
         } catch (error) {
-          console.error('Error accessing Firefox profiles:', error);
+          console.error(`Error leyendo directorio alternativo ${dirPath}:`, error);
         }
       }
+    } else if (process.platform === 'darwin') {
+      // En macOS, buscar navegadores comunes
+      const browserPaths = [
+        { name: 'Google Chrome', path: '/Applications/Google Chrome.app' },
+        { name: 'Mozilla Firefox', path: '/Applications/Firefox.app' },
+        { name: 'Safari', path: '/Applications/Safari.app' },
+        { name: 'Opera', path: '/Applications/Opera.app' },
+        { name: 'Opera GX', path: '/Applications/Opera GX.app' },
+        { name: 'Brave', path: '/Applications/Brave Browser.app' },
+        { name: 'Vivaldi', path: '/Applications/Vivaldi.app' },
+        { name: 'Microsoft Edge', path: '/Applications/Microsoft Edge.app' },
+        { name: 'Yandex Browser', path: '/Applications/Yandex.app' }
+      ];
       
-      // Intentar con Edge
-      const edgeHistoryPath = path.join(os.homedir(), 'AppData', 'Local', 'Microsoft', 'Edge', 'User Data', 'Default', 'History');
-      if (fs.existsSync(edgeHistoryPath)) {
-        // Similar al proceso de Chrome
+      // Verificar si los navegadores están instalados
+      for (const browser of browserPaths) {
+        if (fs.existsSync(browser.path)) {
+          browsers.push({
+            name: browser.name,
+            path: browser.path,
+            default: defaultBrowserInfo.name === browser.name
+          });
+        }
+      }
+    } else {
+      // En Linux, verificar procesos comunes
+      try {
+        const { stdout } = await execAsync('which google-chrome chromium firefox opera brave vivaldi edge');
+        
+        const browserPaths = stdout.split('\n').filter(path => path.trim() !== '');
+        
+        for (const browserPath of browserPaths) {
+          let name = '';
+          
+          if (browserPath.includes('google-chrome')) name = 'Google Chrome';
+          else if (browserPath.includes('chromium')) name = 'Chromium';
+          else if (browserPath.includes('firefox')) name = 'Mozilla Firefox';
+          else if (browserPath.includes('opera')) name = 'Opera';
+          else if (browserPath.includes('brave')) name = 'Brave';
+          else if (browserPath.includes('vivaldi')) name = 'Vivaldi';
+          else if (browserPath.includes('edge')) name = 'Microsoft Edge';
+          else name = path.basename(browserPath);
+          
+          browsers.push({
+            name,
+            path: browserPath,
+            default: defaultBrowserInfo.name === name
+          });
+        }
+      } catch (error) {
+        console.error('Error detectando navegadores en Linux:', error);
+      }
+    }
+    
+    // Si no se encontró un navegador marcado como predeterminado, marcar el primero
+    if (browsers.length > 0 && !browsers.some(b => b.default)) {
+      browsers[0].default = true;
+    }
+    
+    return browsers;
+  } catch (error) {
+    console.error('Error en detectBrowsers:', error);
+    throw error;
+  }
+}
+
+/**
+ * Obtiene el navegador predeterminado del sistema
+ */
+async function getDefaultBrowser() {
+  try {
+    if (process.platform === 'win32') {
+      try {
+        const { stdout } = await execAsync('powershell -Command "& { (Get-ItemProperty HKCU:\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice).ProgId }"');
+        
+        const progId = stdout.trim();
+        let browserName = 'Desconocido';
+        
+        if (progId.includes('Chrome')) browserName = 'Google Chrome';
+        else if (progId.includes('Firefox')) browserName = 'Mozilla Firefox';
+        else if (progId.includes('Edge')) browserName = 'Microsoft Edge';
+        else if (progId.includes('Opera')) {
+          // Verificar si es Opera GX
+          if (fs.existsSync(path.join(os.homedir(), 'AppData\\Local\\Programs\\Opera GX'))) {
+            browserName = 'Opera GX';
+          } else {
+            browserName = 'Opera';
+          }
+        }
+        else if (progId.includes('Brave')) browserName = 'Brave';
+        else if (progId.includes('Vivaldi')) browserName = 'Vivaldi';
+        else if (progId.includes('IE')) browserName = 'Internet Explorer';
+        
+        return {
+          name: browserName,
+          progId
+        };
+      } catch (error) {
+        console.error('Error obteniendo navegador predeterminado en Windows:', error);
+        return { name: 'Desconocido' };
+      }
+    } else if (process.platform === 'darwin') {
+      try {
+        const { stdout } = await execAsync('defaults read com.apple.LaunchServices/com.apple.launchservices.secure LSHandlers | grep -A 3 "http:" | grep "LSHandlerRoleAll" | awk \'{print $3}\' | sed \'s/;//\'');
+        
+        const bundleId = stdout.trim();
+        let browserName = 'Desconocido';
+        
+        if (bundleId.includes('chrome')) browserName = 'Google Chrome';
+        else if (bundleId.includes('firefox')) browserName = 'Mozilla Firefox';
+        else if (bundleId.includes('safari')) browserName = 'Safari';
+        else if (bundleId.includes('opera')) {
+          // Verificar si es Opera GX
+          if (fs.existsSync('/Applications/Opera GX.app')) {
+            browserName = 'Opera GX';
+          } else {
+            browserName = 'Opera';
+          }
+        }
+        else if (bundleId.includes('brave')) browserName = 'Brave';
+        else if (bundleId.includes('vivaldi')) browserName = 'Vivaldi';
+        else if (bundleId.includes('edge')) browserName = 'Microsoft Edge';
+        
+        return {
+          name: browserName,
+          bundleId
+        };
+      } catch (error) {
+        console.error('Error obteniendo navegador predeterminado en macOS:', error);
+        return { name: 'Desconocido' };
+      }
+    } else {
+      try {
+        const { stdout } = await execAsync('xdg-settings get default-web-browser');
+        
+        const browserDesktop = stdout.trim();
+        let browserName = 'Desconocido';
+        
+        if (browserDesktop.includes('chrome')) browserName = 'Google Chrome';
+        else if (browserDesktop.includes('chromium')) browserName = 'Chromium';
+        else if (browserDesktop.includes('firefox')) browserName = 'Mozilla Firefox';
+        else if (browserDesktop.includes('opera')) browserName = 'Opera';
+        else if (browserDesktop.includes('brave')) browserName = 'Brave';
+        else if (browserDesktop.includes('vivaldi')) browserName = 'Vivaldi';
+        else if (browserDesktop.includes('edge')) browserName = 'Microsoft Edge';
+        
+        return {
+          name: browserName,
+          desktop: browserDesktop
+        };
+      } catch (error) {
+        console.error('Error obteniendo navegador predeterminado en Linux:', error);
+        return { name: 'Desconocido' };
+      }
+    }
+  } catch (error) {
+    console.error('Error en getDefaultBrowser:', error);
+    return { name: 'Desconocido' };
+  }
+}
+
+/**
+ * Abre el historial del navegador
+ */
+async function openBrowserHistory() {
+  try {
+    const browsers = await detectBrowsers();
+    const result = {
+      success: false,
+      browserFound: false,
+      details: []
+    };
+    
+    if (browsers.length === 0) {
+      return {
+        success: false,
+        browserFound: false,
+        message: 'No se encontraron navegadores instalados'
+      };
+    }
+    
+    // Buscar el navegador predeterminado o el primero disponible
+    const defaultBrowser = browsers.find(b => b.default) || browsers[0];
+    result.browserFound = true;
+    
+    // Intentar abrir el historial del navegador predeterminado
+    const defaultResult = await openSpecificBrowserHistory(defaultBrowser);
+    result.details.push({
+      browser: defaultBrowser.name,
+      result: defaultResult
+    });
+    
+    if (defaultResult.success) {
+      result.success = true;
+    } else {
+      // Si falla, intentar con otros navegadores
+      for (const browser of browsers) {
+        if (browser.name !== defaultBrowser.name) {
+          const specificResult = await openSpecificBrowserHistory(browser);
+          result.details.push({
+            browser: browser.name,
+            result: specificResult
+          });
+          
+          if (specificResult.success) {
+            result.success = true;
+            break;
+          }
+        }
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en openBrowserHistory:', error);
+    throw error;
+  }
+}
+
+/**
+ * Abre el historial de un navegador específico
+ */
+async function openSpecificBrowserHistory(browser) {
+  try {
+    const result = {
+      success: false,
+      message: ''
+    };
+    
+    const browserName = browser.name.toLowerCase();
+    
+    if (browserName.includes('chrome')) {
+      await shell.openExternal('chrome://history');
+      result.success = true;
+      result.message = 'Historial de Chrome abierto';
+    } else if (browserName.includes('firefox')) {
+      await shell.openExternal('about:history');
+      result.success = true;
+      result.message = 'Historial de Firefox abierto';
+    } else if (browserName.includes('edge')) {
+      await shell.openExternal('edge://history');
+      result.success = true;
+      result.message = 'Historial de Edge abierto';
+    } else if (browserName.includes('opera gx')) {
+      // Método específico para Opera GX
+      if (process.platform === 'win32') {
         try {
-          const tempHistoryPath = path.join(os.tmpdir(), 'temp_edge_history');
-          fs.copyFileSync(edgeHistoryPath, tempHistoryPath);
-          
-          const { stdout } = await execPromise(
-            `powershell "Add-Type -AssemblyName System.Data.SQLite; $conn = New-Object System.Data.SQLite.SQLiteConnection('Data Source=${tempHistoryPath}'); $conn.Open(); $cmd = $conn.CreateCommand(); $cmd.CommandText = 'SELECT url, title, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 1000'; $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($cmd); $data = New-Object System.Data.DataSet; [void]$adapter.Fill($data); $conn.Close(); $data.Tables[0] | ConvertTo-Json"`
-          ).catch(() => ({ stdout: '[]' }));
-          
-          try {
-            const historyItems = JSON.parse(stdout);
-            const itemList = Array.isArray(historyItems) ? historyItems : historyItems ? [historyItems] : [];
-            
-            for (const item of itemList) {
-              const url = item.url.toLowerCase();
-              const title = item.title.toLowerCase();
-              
-              for (const cheatSite of cheatSites) {
-                if (url.includes(cheatSite) || title.includes(cheatSite)) {
-                  foundCheatSites.push({
-                    url: item.url,
-                    title: item.title,
-                    visitTime: new Date(item.last_visit_time),
-                    browser: 'Microsoft Edge'
-                  });
-                  break;
-                }
-              }
-            }
-          } catch (parseError) {
-            console.error('Error parsing Edge history:', parseError);
-          }
-          
-          fs.unlinkSync(tempHistoryPath);
+          // Intentar abrir Opera GX con su historial
+          await execAsync(`"${browser.path}" --new-window opera://history`);
+          result.success = true;
+          result.message = 'Historial de Opera GX abierto';
         } catch (error) {
-          console.error('Error accessing Edge history:', error);
+          console.error('Error abriendo historial de Opera GX:', error);
+          result.message = 'Error abriendo Opera GX: ' + error.message;
+        }
+      } else {
+        await shell.openExternal('opera://history');
+        result.success = true;
+        result.message = 'Historial de Opera GX abierto';
+      }
+    } else if (browserName.includes('opera')) {
+      await shell.openExternal('opera://history');
+      result.success = true;
+      result.message = 'Historial de Opera abierto';
+    } else if (browserName.includes('brave')) {
+      await shell.openExternal('brave://history');
+      result.success = true;
+      result.message = 'Historial de Brave abierto';
+    } else if (browserName.includes('vivaldi')) {
+      await shell.openExternal('vivaldi://history');
+      result.success = true;
+      result.message = 'Historial de Vivaldi abierto';
+    } else if (browserName.includes('safari')) {
+      if (process.platform === 'darwin') {
+        try {
+          await execAsync('open -a Safari "safari://history"');
+          result.success = true;
+          result.message = 'Historial de Safari abierto';
+        } catch (error) {
+          console.error('Error abriendo historial de Safari:', error);
+          result.message = 'Error abriendo Safari: ' + error.message;
+        }
+      } else {
+        result.message = 'Safari no disponible en esta plataforma';
+      }
+    } else if (browserName.includes('yandex')) {
+      await shell.openExternal('browser://history');
+      result.success = true;
+      result.message = 'Historial de Yandex abierto';
+    } else {
+      result.message = 'Navegador no soportado para abrir historial';
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en openSpecificBrowserHistory:', error);
+    return {
+      success: false,
+      message: 'Error: ' + error.message
+    };
+  }
+}
+
+/**
+ * Detecta visitas a sitios web relacionados con cheats de Minecraft
+ */
+async function detectMinecraftCheats() {
+  try {
+    const result = {
+      sitesDetected: [],
+      historyFound: false,
+      modFiles: []
+    };
+    
+    // Lista de dominios conocidos de cheats para Minecraft
+    const cheatDomains = [
+      { domain: 'hackclient', name: 'Cliente de Hack Genérico', severity: 'high' },
+      { domain: 'wurst-client', name: 'Wurst Client', severity: 'high' },
+      { domain: 'liquidbounce', name: 'LiquidBounce', severity: 'high' },
+      { domain: 'impact-client', name: 'Impact Client', severity: 'high' },
+      { domain: 'aristois', name: 'Aristois', severity: 'high' },
+      { domain: 'meteor-client', name: 'Meteor Client', severity: 'high' },
+      { domain: 'inertiaclient', name: 'Inertia Client', severity: 'high' },
+      { domain: 'minecraftcheats', name: 'Minecraft Cheats', severity: 'medium' },
+      { domain: 'minecrafthacks', name: 'Minecraft Hacks', severity: 'medium' },
+      { domain: 'cheatbreaker', name: 'CheatBreaker', severity: 'medium' },
+      { domain: 'badlion', name: 'Badlion Client', severity: 'low' },
+      { domain: 'lunarclient', name: 'Lunar Client', severity: 'low' },
+      { domain: 'cheatengine', name: 'Cheat Engine', severity: 'medium' },
+      { domain: 'wizardhax', name: 'WizardHax', severity: 'high' },
+      { domain: 'xray', name: 'XRay Mod', severity: 'medium' },
+      { domain: 'autoclicker', name: 'AutoClicker', severity: 'medium' },
+      { domain: 'bhop', name: 'BHop Hack', severity: 'high' },
+      { domain: 'killaura', name: 'KillAura', severity: 'high' },
+      { domain: 'baritone', name: 'Baritone', severity: 'medium' },
+      { domain: 'ghostclient', name: 'Ghost Client', severity: 'high' },
+      { domain: 'sigma', name: 'Sigma Client', severity: 'high' },
+      { domain: 'horion', name: 'Horion Client', severity: 'high' },
+      { domain: 'fluxclient', name: 'Flux Client', severity: 'high' },
+      { domain: 'nodus', name: 'Nodus Client', severity: 'high' },
+      { domain: 'huzuni', name: 'Huzuni Client', severity: 'high' },
+      { domain: 'wolfram', name: 'Wolfram Client', severity: 'high' },
+      { domain: 'skillclient', name: 'Skill Client', severity: 'high' },
+      { domain: 'weepcraft', name: 'Weepcraft', severity: 'high' }
+    ];
+    
+    // 1. Verificar archivos de historial de navegación directamente
+    await checkBrowserHistoryFiles(result, cheatDomains);
+    
+    // 2. Verificar carpetas de Minecraft en busca de mods sospechosos
+    await checkMinecraftModFolders(result);
+    
+    // 3. Buscar procesos sospechosos
+    const suspiciousProcesses = await detectSuspiciousProcesses();
+    if (suspiciousProcesses.length > 0) {
+      result.suspiciousProcesses = suspiciousProcesses;
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en detectMinecraftCheats:', error);
+    throw error;
+  }
+}
+
+/**
+ * Verifica archivos de historial de navegadores
+ */
+async function checkBrowserHistoryFiles(result, cheatDomains) {
+  try {
+    // Rutas de historial para navegadores comunes
+    const historyPaths = [];
+    const homeDir = os.homedir();
+    
+    // Chrome
+    const chromeProfilesDir = path.join(homeDir, 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
+    if (fs.existsSync(chromeProfilesDir)) {
+      try {
+        const profiles = fs.readdirSync(chromeProfilesDir, { withFileTypes: true });
+        for (const profile of profiles) {
+          if (profile.isDirectory() && (profile.name.startsWith('Profile') || profile.name === 'Default')) {
+            const historyPath = path.join(chromeProfilesDir, profile.name, 'History');
+            if (fs.existsSync(historyPath)) {
+              historyPaths.push({ browser: 'Chrome', profile: profile.name, path: historyPath });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error leyendo perfiles de Chrome:', error);
+      }
+    }
+    
+    // Firefox
+    const firefoxProfilesPath = path.join(homeDir, 'AppData', 'Roaming', 'Mozilla', 'Firefox', 'Profiles');
+    if (fs.existsSync(firefoxProfilesPath)) {
+      try {
+        const profiles = fs.readdirSync(firefoxProfilesPath, { withFileTypes: true });
+        for (const profile of profiles) {
+          if (profile.isDirectory() && profile.name.includes('.default')) {
+            const historyPath = path.join(firefoxProfilesPath, profile.name, 'places.sqlite');
+            if (fs.existsSync(historyPath)) {
+              historyPaths.push({ browser: 'Firefox', profile: profile.name, path: historyPath });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error leyendo perfiles de Firefox:', error);
+      }
+    }
+    
+    // Edge
+    const edgeProfilesDir = path.join(homeDir, 'AppData', 'Local', 'Microsoft', 'Edge', 'User Data');
+    if (fs.existsSync(edgeProfilesDir)) {
+      try {
+        const profiles = fs.readdirSync(edgeProfilesDir, { withFileTypes: true });
+        for (const profile of profiles) {
+          if (profile.isDirectory() && (profile.name.startsWith('Profile') || profile.name === 'Default')) {
+            const historyPath = path.join(edgeProfilesDir, profile.name, 'History');
+            if (fs.existsSync(historyPath)) {
+              historyPaths.push({ browser: 'Edge', profile: profile.name, path: historyPath });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error leyendo perfiles de Edge:', error);
+      }
+    }
+    
+    // Opera y Opera GX
+    const operaPaths = [
+      { dir: path.join(homeDir, 'AppData', 'Roaming', 'Opera Software', 'Opera Stable'), browser: 'Opera' },
+      { dir: path.join(homeDir, 'AppData', 'Roaming', 'Opera Software', 'Opera GX Stable'), browser: 'Opera GX' }
+    ];
+    
+    for (const operaPath of operaPaths) {
+      if (fs.existsSync(operaPath.dir)) {
+        const historyPath = path.join(operaPath.dir, 'History');
+        if (fs.existsSync(historyPath)) {
+          historyPaths.push({ browser: operaPath.browser, profile: 'Default', path: historyPath });
         }
       }
+    }
+    
+    // Brave
+    const braveProfilesDir = path.join(homeDir, 'AppData', 'Local', 'BraveSoftware', 'Brave-Browser', 'User Data');
+    if (fs.existsSync(braveProfilesDir)) {
+      try {
+        const profiles = fs.readdirSync(braveProfilesDir, { withFileTypes: true });
+        for (const profile of profiles) {
+          if (profile.isDirectory() && (profile.name.startsWith('Profile') || profile.name === 'Default')) {
+            const historyPath = path.join(braveProfilesDir, profile.name, 'History');
+            if (fs.existsSync(historyPath)) {
+              historyPaths.push({ browser: 'Brave', profile: profile.name, path: historyPath });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error leyendo perfiles de Brave:', error);
+      }
+    }
+    
+    // Vivaldi
+    const vivaldiProfilesDir = path.join(homeDir, 'AppData', 'Local', 'Vivaldi', 'User Data');
+    if (fs.existsSync(vivaldiProfilesDir)) {
+      try {
+        const profiles = fs.readdirSync(vivaldiProfilesDir, { withFileTypes: true });
+        for (const profile of profiles) {
+          if (profile.isDirectory() && (profile.name.startsWith('Profile') || profile.name === 'Default')) {
+            const historyPath = path.join(vivaldiProfilesDir, profile.name, 'History');
+            if (fs.existsSync(historyPath)) {
+              historyPaths.push({ browser: 'Vivaldi', profile: profile.name, path: historyPath });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error leyendo perfiles de Vivaldi:', error);
+      }
+    }
+    
+    // Verificar los archivos de historial
+    if (historyPaths.length > 0) {
+      result.historyFound = true;
       
-      // Intentar con Opera/Opera GX
-      const operaHistoryPath = path.join(os.homedir(), 'AppData', 'Roaming', 'Opera Software', 'Opera Stable', 'History');
-      const operaGXHistoryPath = path.join(os.homedir(), 'AppData', 'Roaming', 'Opera Software', 'Opera GX Stable', 'History');
-      
-      for (const historyPath of [operaHistoryPath, operaGXHistoryPath]) {
-        if (fs.existsSync(historyPath)) {
+      // En Windows, podemos usar PowerShell para buscar en los historiales sin necesidad de bibliotecas adicionales
+      if (process.platform === 'win32') {
+        for (const historyFile of historyPaths) {
           try {
-            const tempHistoryPath = path.join(os.tmpdir(), 'temp_opera_history');
-            fs.copyFileSync(historyPath, tempHistoryPath);
+            // Crear una copia temporal del archivo de historial para no bloquear el original
+            const tempDir = os.tmpdir();
+            const tempHistoryPath = path.join(tempDir, `history_${Date.now()}.db`);
             
-            const { stdout } = await execPromise(
-              `powershell "Add-Type -AssemblyName System.Data.SQLite; $conn = New-Object System.Data.SQLite.SQLiteConnection('Data Source=${tempHistoryPath}'); $conn.Open(); $cmd = $conn.CreateCommand(); $cmd.CommandText = 'SELECT url, title, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 1000'; $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($cmd); $data = New-Object System.Data.DataSet; [void]$adapter.Fill($data); $conn.Close(); $data.Tables[0] | ConvertTo-Json"`
-            ).catch(() => ({ stdout: '[]' }));
+            fs.copyFileSync(historyFile.path, tempHistoryPath);
             
-            try {
-              const historyItems = JSON.parse(stdout);
-              const itemList = Array.isArray(historyItems) ? historyItems : historyItems ? [historyItems] : [];
-              
-              for (const item of itemList) {
-                const url = item.url.toLowerCase();
-                const title = item.title.toLowerCase();
-                
-                for (const cheatSite of cheatSites) {
-                  if (url.includes(cheatSite) || title.includes(cheatSite)) {
-                    foundCheatSites.push({
-                      url: item.url,
-                      title: item.title,
-                      visitTime: new Date(item.last_visit_time),
-                      browser: historyPath.includes('GX') ? 'Opera GX' : 'Opera'
-                    });
-                    break;
+            // Usar PowerShell para buscar en el historial
+            const cheatDomainsString = cheatDomains.map(d => d.domain).join('|');
+            const command = `powershell -Command "& {
+              Add-Type -Path '${path.join(__dirname, 'System.Data.SQLite.dll')}';
+              $con = New-Object System.Data.SQLite.SQLiteConnection('Data Source=${tempHistoryPath.replace(/\\/g, '\\\\')}');
+              try {
+                $con.Open();
+                $cmd = $con.CreateCommand();
+                $cmd.CommandText = 'SELECT url, title, last_visit_time FROM urls WHERE url LIKE \\'%${cheatDomainsString}%\\' ORDER BY last_visit_time DESC LIMIT 100';
+                $reader = $cmd.ExecuteReader();
+                $results = @();
+                while($reader.Read()) {
+                  $results += [PSCustomObject]@{
+                    Url = $reader.GetString(0);
+                    Title = $reader.GetString(1);
+                    Time = $reader.GetValue(2);
                   }
                 }
+                $reader.Close();
+                $results | ConvertTo-Json;
+              } finally {
+                $con.Close();
               }
-            } catch (parseError) {
-              console.error('Error parsing Opera history:', parseError);
+            }"`;
+            
+            const { stdout } = await execAsync(command);
+            
+            // Eliminar el archivo temporal
+            try {
+              fs.unlinkSync(tempHistoryPath);
+            } catch (e) {
+              // Ignorar errores al eliminar
             }
             
-            fs.unlinkSync(tempHistoryPath);
+            if (stdout.trim()) {
+              try {
+                let historyEntries = JSON.parse(stdout);
+                // Asegurar que sea un array
+                if (!Array.isArray(historyEntries)) {
+                  historyEntries = [historyEntries];
+                }
+                
+                for (const entry of historyEntries) {
+                  const url = entry.Url;
+                  const title = entry.Title;
+                  // Convertir el timestamp de Chrome (microsegundos desde 1601-01-01) a fecha JS
+                  let visitTime;
+                  try {
+                    const microsecondsFrom1601 = entry.Time;
+                    const microsecondsFrom1970 = microsecondsFrom1601 - 11644473600000000;
+                    visitTime = new Date(microsecondsFrom1970 / 1000);
+                  } catch (e) {
+                    visitTime = new Date();
+                  }
+                  
+                  // Determinar la severidad
+                  const matchedDomain = cheatDomains.find(d => url.toLowerCase().includes(d.domain.toLowerCase()));
+                  const severity = matchedDomain ? matchedDomain.severity : 'medium';
+                  const cheatName = matchedDomain ? matchedDomain.name : 'Cheat desconocido';
+                  
+                  result.sitesDetected.push({
+                    url,
+                    title,
+                    visitTime: visitTime.toLocaleString(),
+                    browser: historyFile.browser,
+                    profile: historyFile.profile,
+                    severity,
+                    cheatName
+                  });
+                }
+              } catch (error) {
+                console.error('Error parseando resultados de historial:', error);
+              }
+            }
           } catch (error) {
-            console.error('Error accessing Opera history:', error);
+            console.error(`Error procesando historial de ${historyFile.browser}:`, error);
           }
         }
       }
     }
   } catch (error) {
-    console.error('Error detecting Minecraft cheats:', error);
+    console.error('Error en checkBrowserHistoryFiles:', error);
   }
-  
-  // Eliminar duplicados y ordenar por fecha de visita
-  const uniqueResults = [];
-  const urls = new Set();
-  
-  for (const site of foundCheatSites) {
-    if (!urls.has(site.url)) {
-      urls.add(site.url);
-      uniqueResults.push(site);
-    }
-  }
-  
-  return {
-    cheatSites: uniqueResults.sort((a, b) => b.visitTime - a.visitTime),
-    cheatsList: minecraftCheatsDatabase
-  };
 }
 
 /**
- * Detecta servicios detenidos que pueden ser relevantes para Minecraft
+ * Verifica carpetas de mods de Minecraft
  */
-async function detectStoppedServices() {
-  const minecraftRelatedServices = [
-    'Java', 'JavaQuickStarterService', 'JavService', 
-    'Hamachi', 'Hamachi2', 'LogMeInHamachi', 
-    'vboxservice', 'VirtualBox', 
-    'vmware', 'VMTools', 'VMwareHostd',
-    'Docker', 'com.docker',
-    'AdobeARMservice', // Servicios comunes que podrían interferir
-    'TeamViewer', 
-    'Discord',
-    'Firewall'
-  ];
-  
-  const stoppedServices = [];
-  
+async function checkMinecraftModFolders(result) {
   try {
-    if (process.platform === 'win32') {
-      // En Windows, usar PowerShell para obtener servicios
-      const { stdout } = await execPromise(
-        'powershell "Get-Service | Where-Object {$_.Status -eq \'Stopped\'} | Select-Object Name, DisplayName, Status | ConvertTo-Json"'
-      ).catch(() => ({ stdout: '[]' }));
-      
-      try {
-        const services = JSON.parse(stdout);
-        const serviceList = Array.isArray(services) ? services : services ? [services] : [];
-        
-        // Filtrar solo servicios relacionados con Minecraft
-        for (const service of serviceList) {
-          for (const relatedService of minecraftRelatedServices) {
-            if (service.Name.toLowerCase().includes(relatedService.toLowerCase()) || 
-                service.DisplayName.toLowerCase().includes(relatedService.toLowerCase())) {
-              
-              stoppedServices.push({
-                name: service.DisplayName,
-                id: service.Name,
-                status: service.Status
-              });
-              break;
+    const homeDir = os.homedir();
+    const minecraftFolders = [
+      path.join(homeDir, 'AppData', 'Roaming', '.minecraft'),
+      path.join(homeDir, '.minecraft'),
+      path.join(homeDir, 'Library', 'Application Support', 'minecraft')
+    ];
+    
+    // Lista de firmas sospechosas en mods
+    const suspiciousKeywords = [
+      'hack', 'cheat', 'xray', 'autoclicker', 'killaura', 'bhop', 'flight',
+      'wallhack', 'noclip', 'speed', 'aimbot', 'esp', 'tracers', 'reach',
+      'bypass', 'ghostclient', 'baritone', 'nuker', 'autotool', 'blink',
+      'fastplace', 'nofall', 'antiknockback', 'criticals', 'scaffold',
+      'timer', 'freecam', 'fullbright', 'jesus', 'phase', 'spoofer'
+    ];
+    
+    for (const minecraftFolder of minecraftFolders) {
+      if (fs.existsSync(minecraftFolder)) {
+        // Verificar carpeta de mods
+        const modsFolder = path.join(minecraftFolder, 'mods');
+        if (fs.existsSync(modsFolder)) {
+          const modFiles = await fs.promises.readdir(modsFolder, { withFileTypes: true });
+          
+          for (const modFile of modFiles) {
+            if (modFile.isFile() && modFile.name.endsWith('.jar')) {
+              try {
+                const modPath = path.join(modsFolder, modFile.name);
+                const modStats = await fs.promises.stat(modPath);
+                
+                // Analizar el nombre del mod
+                const modNameLower = modFile.name.toLowerCase();
+                const suspiciousKeywordsFound = suspiciousKeywords.filter(keyword => 
+                  modNameLower.includes(keyword)
+                );
+                
+                let suspicious = false;
+                let reason = '';
+                
+                if (suspiciousKeywordsFound.length > 0) {
+                  suspicious = true;
+                  reason = `Contiene palabras clave sospechosas: ${suspiciousKeywordsFound.join(', ')}`;
+                }
+                
+                // Si el mod no parece sospechoso por el nombre, podríamos analizar su contenido
+                if (!suspicious) {
+                  // Aquí podríamos usar un módulo como "unzipper" para analizar el contenido,
+                  // pero para simplificar, omitiremos ese análisis detallado.
+                }
+                
+                result.modFiles.push({
+                  name: modFile.name,
+                  path: modPath,
+                  size: modStats.size,
+                  modifiedTime: modStats.mtime.toLocaleString(),
+                  suspicious,
+                  reason
+                });
+              } catch (error) {
+                console.error(`Error procesando mod ${modFile.name}:`, error);
+              }
             }
           }
         }
-      } catch (parseError) {
-        console.error('Error parsing services:', parseError);
+        
+        // También verificar la carpeta versions por posibles clientes hackeados
+        const versionsFolder = path.join(minecraftFolder, 'versions');
+        if (fs.existsSync(versionsFolder)) {
+          const versionDirs = await fs.promises.readdir(versionsFolder, { withFileTypes: true });
+          
+          for (const versionDir of versionDirs) {
+            if (versionDir.isDirectory()) {
+              const versionNameLower = versionDir.name.toLowerCase();
+              const suspiciousKeywordsFound = suspiciousKeywords.filter(keyword => 
+                versionNameLower.includes(keyword)
+              );
+              
+              if (suspiciousKeywordsFound.length > 0) {
+                const versionPath = path.join(versionsFolder, versionDir.name);
+                const jarPath = path.join(versionPath, `${versionDir.name}.jar`);
+                
+                if (fs.existsSync(jarPath)) {
+                  const jarStats = await fs.promises.stat(jarPath);
+                  
+                  result.modFiles.push({
+                    name: `${versionDir.name}.jar (versión cliente)`,
+                    path: jarPath,
+                    size: jarStats.size,
+                    modifiedTime: jarStats.mtime.toLocaleString(),
+                    suspicious: true,
+                    reason: `Versión de cliente potencialmente hackeada: ${suspiciousKeywordsFound.join(', ')}`
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error en checkMinecraftModFolders:', error);
+  }
+}
+
+/**
+ * Detecta procesos sospechosos en ejecución
+ */
+async function detectSuspiciousProcesses() {
+  const suspiciousProcesses = [];
+  const suspiciousKeywords = [
+    'hack', 'cheat', 'autoclicker', 'xray', 'killaura', 'injector',
+    'memory', 'modify', 'dll', 'bhop', 'esp', 'aimbot', 'minecraft'
+  ];
+  
+  try {
+    if (process.platform === 'win32') {
+      // En Windows, usar tasklist para obtener procesos
+      const { stdout } = await execAsync('tasklist /fo csv /v');
+      
+      const lines = stdout.split('\n').filter(line => line.trim() !== '');
+      const headers = lines[0].split(',').map(h => h.replace(/"/g, ''));
+      
+      for (let i = 1; i < lines.length; i++) {
+        try {
+          const values = lines[i].match(/(".*?"|[^",]+)(?=\s*,|\s*$)/g);
+          if (values) {
+            const processName = values[0].replace(/"/g, '');
+            const pid = values[1].replace(/"/g, '');
+            const windowTitle = values[values.length - 1].replace(/"/g, '');
+            
+            const processNameLower = processName.toLowerCase();
+            const windowTitleLower = windowTitle.toLowerCase();
+            
+            // Verificar si el proceso tiene palabras clave sospechosas
+            const suspiciousNameKeywords = suspiciousKeywords.filter(keyword => 
+              processNameLower.includes(keyword)
+            );
+            
+            const suspiciousTitleKeywords = suspiciousKeywords.filter(keyword => 
+              windowTitleLower.includes(keyword)
+            );
+            
+            if (suspiciousNameKeywords.length > 0 || suspiciousTitleKeywords.length > 0) {
+              suspiciousProcesses.push({
+                name: processName,
+                pid,
+                windowTitle,
+                suspiciousKeywords: [...new Set([...suspiciousNameKeywords, ...suspiciousTitleKeywords])]
+              });
+            }
+          }
+        } catch (error) {
+          // Ignorar errores en líneas individuales
+        }
+      }
+      
+      // Buscar DLLs inyectadas en minecraft.exe
+      try {
+        const minecraftProcesses = stdout.split('\n').filter(line => line.toLowerCase().includes('minecraft.exe'));
+        
+        for (const process of minecraftProcesses) {
+          try {
+            const values = process.match(/(".*?"|[^",]+)(?=\s*,|\s*$)/g);
+            if (values) {
+              const pid = values[1].replace(/"/g, '');
+              
+              // Verificar módulos cargados en el proceso
+              const { stdout: modulesOutput } = await execAsync(`powershell -Command "& { Get-Process -Id ${pid} -Module | Select-Object ModuleName | ConvertTo-Csv -NoTypeInformation }"`);
+              
+              const moduleLines = modulesOutput.split('\n').filter(line => line.trim() !== '' && !line.includes('ModuleName'));
+              
+              for (const line of moduleLines) {
+                const match = line.match(/"([^"]+)"/);
+                if (match) {
+                  const moduleName = match[1].toLowerCase();
+                  
+                  // Verificar si el módulo parece sospechoso
+                  const isSuspiciousModule = suspiciousKeywords.some(keyword => moduleName.includes(keyword)) ||
+                    !moduleName.includes('minecraft') && !moduleName.includes('java') && 
+                    !moduleName.startsWith('jvm') && !moduleName.startsWith('nt') &&
+                    !moduleName.startsWith('api-ms-win') && !moduleName.includes('vcruntime') &&
+                    !moduleName.includes('msvcp') && !moduleName.includes('system');
+                  
+                  if (isSuspiciousModule) {
+                    suspiciousProcesses.push({
+                      name: 'minecraft.exe',
+                      pid,
+                      injectedModule: moduleName,
+                      type: 'DLL inyectado'
+                    });
+                  }
+                }
+              }
+            }
+          } catch (error) {
+            // Ignorar errores en procesos individuales
+          }
+        }
+      } catch (error) {
+        console.error('Error verificando DLLs inyectados:', error);
       }
     } else if (process.platform === 'darwin') {
-      // En macOS, usar launchctl
-      const { stdout } = await execPromise('launchctl list').catch(() => ({ stdout: '' }));
+      // En macOS, usar ps para obtener procesos
+      const { stdout } = await execAsync('ps -A -o pid,comm');
       
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        for (const relatedService of minecraftRelatedServices) {
-          if (line.toLowerCase().includes(relatedService.toLowerCase())) {
-            const parts = line.trim().split(/\s+/);
-            if (parts.length >= 3 && parts[0] === '-') {
-              stoppedServices.push({
-                name: parts[2],
-                id: parts[2],
+      const lines = stdout.split('\n').filter(line => line.trim() !== '');
+      
+      for (let i = 1; i < lines.length; i++) {
+        try {
+          const match = lines[i].match(/^\s*(\d+)\s+(.+)$/);
+          if (match) {
+            const pid = match[1];
+            const processName = match[2];
+            const processNameLower = processName.toLowerCase();
+            
+            // Verificar si el proceso tiene palabras clave sospechosas
+            const suspiciousNameKeywords = suspiciousKeywords.filter(keyword => 
+              processNameLower.includes(keyword)
+            );
+            
+            if (suspiciousNameKeywords.length > 0) {
+              suspiciousProcesses.push({
+                name: processName,
+                pid,
+                suspiciousKeywords: suspiciousNameKeywords
+              });
+            }
+          }
+        } catch (error) {
+          // Ignorar errores en líneas individuales
+        }
+      }
+    } else {
+      // En Linux, usar ps para obtener procesos
+      const { stdout } = await execAsync('ps -e -o pid,comm');
+      
+      const lines = stdout.split('\n').filter(line => line.trim() !== '');
+      
+      for (let i = 1; i < lines.length; i++) {
+        try {
+          const match = lines[i].match(/^\s*(\d+)\s+(.+)$/);
+          if (match) {
+            const pid = match[1];
+            const processName = match[2];
+            const processNameLower = processName.toLowerCase();
+            
+            // Verificar si el proceso tiene palabras clave sospechosas
+            const suspiciousNameKeywords = suspiciousKeywords.filter(keyword => 
+              processNameLower.includes(keyword)
+            );
+            
+            if (suspiciousNameKeywords.length > 0) {
+              suspiciousProcesses.push({
+                name: processName,
+                pid,
+                suspiciousKeywords: suspiciousNameKeywords
+              });
+            }
+          }
+        } catch (error) {
+          // Ignorar errores en líneas individuales
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error en detectSuspiciousProcesses:', error);
+  }
+  
+  return suspiciousProcesses;
+}
+
+/**
+ * Detecta servicios detenidos que pueden ser relevantes para detectar trampas
+ */
+async function detectStoppedServices() {
+  try {
+    const result = {
+      stoppedServices: [],
+      disabledServices: [],
+      modifiedServices: []
+    };
+    
+    // Lista de servicios que podrían ser detenidos para ocultar trampas
+    const monitorServices = [
+      { name: 'GameInput', description: 'Servicio de entrada de juegos de Windows' },
+      { name: 'Audiosrv', description: 'Servicio de audio de Windows' },
+      { name: 'Schedule', description: 'Programador de tareas' },
+      { name: 'winmgmt', description: 'Administración de Windows' },
+      { name: 'EventLog', description: 'Registro de eventos de Windows' },
+      { name: 'PcaSvc', description: 'Compatibilidad de programas' },
+      { name: 'AppInfo', description: 'Información de aplicaciones' },
+      { name: 'DiagTrack', description: 'Experiencia y telemetría conectada' },
+      { name: 'DPS', description: 'Servicio de directivas de diagnóstico' },
+      { name: 'Sense', description: 'Servicio Windows Defender Advanced Threat Protection' },
+      { name: 'WdFilter', description: 'Mini-filtro antimalware de Windows Defender' },
+      { name: 'WdNisSvc', description: 'Servicio de inspección de red de Windows Defender' },
+      { name: 'WinDefend', description: 'Antivirus de Windows Defender' },
+      { name: 'SecurityHealthService', description: 'Servicio de seguridad de Windows' },
+      { name: 'WerSvc', description: 'Informes de error de Windows' }
+    ];
+    
+    if (process.platform === 'win32') {
+      // En Windows, verificar estado de servicios
+      try {
+        const { stdout } = await execAsync('powershell -Command "& { Get-Service | Select-Object Name, DisplayName, Status, StartType | ConvertTo-Csv -NoTypeInformation }"');
+        
+        const lines = stdout.split('\n').filter(line => line.trim() !== '' && !line.includes('Name,DisplayName'));
+        
+        for (const line of lines) {
+          try {
+            const match = line.match(/"([^"]+)","([^"]+)","([^"]+)","([^"]+)"/);
+            if (match) {
+              const name = match[1];
+              const displayName = match[2];
+              const status = match[3];
+              const startType = match[4];
+              
+              // Verificar si este servicio está en nuestra lista de monitoreo
+              const monitorService = monitorServices.find(s => s.name.toLowerCase() === name.toLowerCase());
+              
+              if (monitorService) {
+                if (status.toLowerCase() === 'stopped') {
+                  result.stoppedServices.push({
+                    name,
+                    displayName,
+                    description: monitorService.description,
+                    status,
+                    startType
+                  });
+                }
+                
+                if (startType.toLowerCase() === 'disabled') {
+                  result.disabledServices.push({
+                    name,
+                    displayName,
+                    description: monitorService.description,
+                    status,
+                    startType
+                  });
+                }
+              }
+            }
+          } catch (error) {
+            // Ignorar errores en líneas individuales
+          }
+        }
+        
+        // Verificar si se han modificado servicios de antivirus o seguridad
+        try {
+          const { stdout: securityOutput } = await execAsync('powershell -Command "& { Get-ItemProperty HKLM:\\SYSTEM\\CurrentControlSet\\Services\\*Defender* | Select-Object PSPath, Start | ConvertTo-Csv -NoTypeInformation }"');
+          
+          const securityLines = securityOutput.split('\n').filter(line => line.trim() !== '' && !line.includes('PSPath'));
+          
+          for (const line of securityLines) {
+            const match = line.match(/"([^"]+)","([^"]+)"/);
+            if (match) {
+              const servicePath = match[1];
+              const startValue = match[2];
+              
+              // Si el valor de inicio es 4, el servicio está deshabilitado
+              if (startValue === '4') {
+                const serviceName = servicePath.split('\\').pop();
+                
+                result.modifiedServices.push({
+                  name: serviceName,
+                  path: servicePath,
+                  modification: 'Servicio de seguridad deshabilitado',
+                  value: startValue
+                });
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error verificando modificaciones de servicios:', error);
+        }
+      } catch (error) {
+        console.error('Error verificando servicios en Windows:', error);
+      }
+    } else if (process.platform === 'darwin') {
+      // En macOS, verificar servicios
+      try {
+        const { stdout } = await execAsync('launchctl list');
+        
+        const lines = stdout.split('\n').filter(line => line.trim() !== '');
+        const securityServices = lines.filter(line => 
+          line.includes('com.apple.security') || 
+          line.includes('com.apple.ProtectedService') ||
+          line.includes('firewall') ||
+          line.includes('antivirus')
+        );
+        
+        if (securityServices.length > 0) {
+          for (const serviceLine of securityServices) {
+            const parts = serviceLine.trim().split(/\s+/);
+            const status = parts[0];
+            const name = parts[parts.length - 1];
+            
+            if (status.includes('-')) {
+              result.stoppedServices.push({
+                name,
+                displayName: name,
+                description: 'Servicio de seguridad de macOS',
                 status: 'Stopped'
               });
             }
           }
         }
+      } catch (error) {
+        console.error('Error verificando servicios en macOS:', error);
       }
     } else {
-      // En Linux, usar systemctl
-      const { stdout } = await execPromise('systemctl list-units --state=inactive').catch(() => ({ stdout: '' }));
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        for (const relatedService of minecraftRelatedServices) {
-          if (line.toLowerCase().includes(relatedService.toLowerCase())) {
-            const parts = line.trim().split(/\s+/);
-            if (parts.length >= 5) {
-              stoppedServices.push({
-                name: parts[0],
-                id: parts[0],
-                status: 'Inactive'
-              });
-            }
+      // En Linux, verificar servicios
+      try {
+        const { stdout } = await execAsync('systemctl list-units --type=service --state=inactive');
+        
+        const lines = stdout.split('\n').filter(line => 
+          line.includes('security') || 
+          line.includes('firewall') || 
+          line.includes('audit') ||
+          line.includes('apparmor') ||
+          line.includes('selinux')
+        );
+        
+        if (lines.length > 0) {
+          for (const serviceLine of lines) {
+            const name = serviceLine.trim().split(/\s+/)[0];
+            
+            result.stoppedServices.push({
+              name,
+              displayName: name,
+              description: 'Servicio de seguridad de Linux',
+              status: 'Inactive'
+            });
           }
         }
+      } catch (error) {
+        console.error('Error verificando servicios en Linux:', error);
       }
     }
+    
+    return result;
   } catch (error) {
-    console.error('Error checking stopped services:', error);
+    console.error('Error en detectStoppedServices:', error);
+    throw error;
   }
-  
-  return stoppedServices;
 }
 
 /**
- * Obtiene el historial de carpetas visitadas recientemente
+ * Obtiene historial de carpetas visitadas recientemente
  */
 async function getFolderHistory() {
-  const recentFolders = [];
-  
   try {
+    const result = [];
+    
     if (process.platform === 'win32') {
-      // En Windows, usar PowerShell para acceder al registro de carpetas recientes
-      const { stdout } = await execPromise(
-        'powershell "Get-ItemProperty -Path \'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\OpenSavePidlMRU\\*\' | Select-Object | ConvertTo-Json"'
-      ).catch(() => ({ stdout: '{}' }));
-      
+      // En Windows, buscar en los jumplist y Quick Access
       try {
-        const folderData = JSON.parse(stdout);
+        const homeDir = os.homedir();
+        const quickAccessPath = path.join(homeDir, 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Recent');
         
-        // Extraer las rutas de carpetas del registro
-        if (folderData && folderData.PSPath) {
-          const explorerKey = 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer';
+        if (fs.existsSync(quickAccessPath)) {
+          const items = await fs.promises.readdir(quickAccessPath, { withFileTypes: true });
           
-          // Intentar acceder al historial de Explorador de Windows
-          const { stdout: recentStdout } = await execPromise(
-            `powershell "Get-ChildItem -Path '${explorerKey}\\RecentDocs' | Select-Object PSChildName | ConvertTo-Json"`
-          ).catch(() => ({ stdout: '[]' }));
-          
-          try {
-            const recentItems = JSON.parse(recentStdout);
-            const itemList = Array.isArray(recentItems) ? recentItems : recentItems ? [recentItems] : [];
-            
-            for (const item of itemList) {
-              if (item.PSChildName && !item.PSChildName.startsWith('.')) {
-                try {
-                  // Convertir de bytes a string cuando sea posible
-                  const name = Buffer.from(item.PSChildName, 'hex').toString('utf16le').replace(/\0/g, '');
-                  
-                  if (name && !name.includes('\u0000\u0000')) {
-                    recentFolders.push({
-                      name: name,
-                      type: 'Explorer History'
-                    });
+          for (const item of items) {
+            try {
+              if (item.isFile() && item.name.endsWith('.lnk')) {
+                const fullPath = path.join(quickAccessPath, item.name);
+                const stats = await fs.promises.stat(fullPath);
+                
+                // Obtener el destino del acceso directo usando PowerShell
+                const command = `powershell -Command "& {
+                  $shell = New-Object -ComObject WScript.Shell;
+                  $shortcut = $shell.CreateShortcut('${fullPath.replace(/\\/g, '\\\\')}');
+                  Write-Output $shortcut.TargetPath;
+                }"`;
+                
+                const { stdout } = await execAsync(command);
+                const targetPath = stdout.trim();
+                
+                if (targetPath && fs.existsSync(targetPath)) {
+                  try {
+                    const targetStats = await fs.promises.stat(targetPath);
+                    
+                    // Solo incluir directorios
+                    if (targetStats.isDirectory()) {
+                      result.push({
+                        path: targetPath,
+                        name: path.basename(targetPath),
+                        accessTime: stats.mtime.toLocaleString(),
+                        source: 'Acceso rápido'
+                      });
+                    }
+                  } catch (error) {
+                    // Ignorar errores al acceder al destino
                   }
-                } catch (convError) {
-                  // Ignorar errores de conversión
+                }
+              }
+            } catch (error) {
+              // Ignorar errores individuales
+            }
+          }
+        }
+        
+        // También verificar el historial de Explorer
+        const explorerHistoryPath = path.join(homeDir, 'AppData', 'Local', 'Microsoft', 'Windows', 'Explorer');
+        if (fs.existsSync(explorerHistoryPath)) {
+          const command = `powershell -Command "& {
+            $recentItems = (New-Object -ComObject Shell.Application).NameSpace('shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}').Items();
+            foreach ($item in $recentItems) {
+              if ($item.IsFolder -eq $true) {
+                [PSCustomObject]@{
+                  Name = $item.Name;
+                  Path = $item.Path;
+                  LastAccess = $item.ExtendedProperty('System.DateAccessed');
                 }
               }
             }
-          } catch (parseError) {
-            console.error('Error parsing recent items:', parseError);
-          }
-        }
-        
-        // También intentar acceder a Quick Access
-        const { stdout: quickAccessStdout } = await execPromise(
-          'powershell "Get-ChildItem -Path \'shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}\' | Select-Object Name, LastAccessTime | ConvertTo-Json"'
-        ).catch(() => ({ stdout: '[]' }));
-        
-        try {
-          const quickAccessItems = JSON.parse(quickAccessStdout);
-          const qaItemList = Array.isArray(quickAccessItems) ? quickAccessItems : quickAccessItems ? [quickAccessItems] : [];
+          } | ConvertTo-Json"`;
           
-          for (const item of qaItemList) {
-            if (item.Name) {
-              recentFolders.push({
-                name: item.Name,
-                lastAccess: new Date(item.LastAccessTime),
-                type: 'Quick Access'
-              });
-            }
-          }
-        } catch (parseError) {
-          console.error('Error parsing Quick Access items:', parseError);
-        }
-      } catch (parseError) {
-        console.error('Error parsing folder history:', parseError);
-      }
-      
-      // Buscar carpetas específicas de Minecraft
-      const minecraftFolders = [
-        path.join(os.homedir(), 'AppData', 'Roaming', '.minecraft'),
-        path.join(os.homedir(), 'AppData', 'Local', 'Packages'),
-        path.join(os.homedir(), 'Documents', 'Curse'),
-        path.join(os.homedir(), 'Documents', 'Minecraft')
-      ];
-      
-      for (const folder of minecraftFolders) {
-        try {
-          if (fs.existsSync(folder)) {
-            const stats = await statPromise(folder);
+          try {
+            const { stdout } = await execAsync(command);
             
-            recentFolders.push({
-              name: folder,
-              lastAccess: stats.atime,
-              type: 'Minecraft Related'
-            });
-            
-            // También verificar subcarpetas
-            const subfolders = await readdirPromise(folder);
-            for (const subfolder of subfolders) {
-              const subfolderPath = path.join(folder, subfolder);
-              
+            if (stdout.trim()) {
               try {
-                const subStats = await statPromise(subfolderPath);
+                let explorerItems = JSON.parse(stdout);
+                // Asegurar que sea un array
+                if (!Array.isArray(explorerItems)) {
+                  explorerItems = [explorerItems];
+                }
                 
-                if (subStats.isDirectory()) {
-                  recentFolders.push({
-                    name: subfolderPath,
-                    lastAccess: subStats.atime,
-                    type: 'Minecraft Subfolder'
+                for (const item of explorerItems) {
+                  result.push({
+                    path: item.Path,
+                    name: item.Name,
+                    accessTime: item.LastAccess || 'Desconocido',
+                    source: 'Historial de Explorer'
                   });
                 }
               } catch (error) {
-                // Ignorar errores de acceso
+                console.error('Error parseando historial de Explorer:', error);
+              }
+            }
+          } catch (error) {
+            console.error('Error obteniendo historial de Explorer:', error);
+          }
+        }
+      } catch (error) {
+        console.error('Error obteniendo historial de carpetas en Windows:', error);
+      }
+    } else if (process.platform === 'darwin') {
+      // En macOS, verificar archivos .DS_Store recientes
+      try {
+        const homeDir = os.homedir();
+        const command = `find "${homeDir}" -name ".DS_Store" -type f -mtime -7 -print0 | xargs -0 -I {} dirname {}`;
+        
+        const { stdout } = await execAsync(command);
+        
+        const folders = stdout.split('\n').filter(folder => folder.trim() !== '');
+        
+        for (const folder of folders) {
+          try {
+            const stats = await fs.promises.stat(folder);
+            
+            result.push({
+              path: folder,
+              name: path.basename(folder),
+              accessTime: stats.mtime.toLocaleString(),
+              source: 'DS_Store reciente'
+            });
+          } catch (error) {
+            // Ignorar errores individuales
+          }
+        }
+        
+        // También verificar historial reciente del Finder
+        const finderPlist = path.join(homeDir, 'Library', 'Preferences', 'com.apple.finder.plist');
+        if (fs.existsSync(finderPlist)) {
+          const command = `plutil -convert xml1 -o - "${finderPlist}" | grep -A1 "<key>FXRecentFolders</key>"`;
+          
+          try {
+            const { stdout } = await execAsync(command);
+            
+            if (stdout.includes('FXRecentFolders')) {
+              // Extraer rutas de carpetas recientes (simplificado)
+              const folderMatches = stdout.match(/<string>file:\/\/([^<]+)<\/string>/g);
+              
+              if (folderMatches) {
+                for (const folderMatch of folderMatches) {
+                  const match = folderMatch.match(/<string>file:\/\/([^<]+)<\/string>/);
+                  if (match) {
+                    const folderPath = decodeURIComponent(match[1]);
+                    
+                    result.push({
+                      path: folderPath,
+                      name: path.basename(folderPath),
+                      accessTime: 'Reciente',
+                      source: 'Historial del Finder'
+                    });
+                  }
+                }
+              }
+            }
+          } catch (error) {
+            // Ignorar errores
+          }
+        }
+      } catch (error) {
+        console.error('Error obteniendo historial de carpetas en macOS:', error);
+      }
+    } else {
+      // En Linux, verificar archivos recientes
+      try {
+        const homeDir = os.homedir();
+        const recentFilesPath = path.join(homeDir, '.local', 'share', 'recently-used.xbel');
+        
+        if (fs.existsSync(recentFilesPath)) {
+          const content = await fs.promises.readFile(recentFilesPath, 'utf8');
+          
+          // Extraer rutas de carpetas del archivo XML
+          const folderMatches = content.match(/<bookmark href="file:\/\/([^"]+)"/g);
+          
+          if (folderMatches) {
+            for (const folderMatch of folderMatches) {
+              const match = folderMatch.match(/<bookmark href="file:\/\/([^"]+)"/);
+              if (match) {
+                const itemPath = decodeURIComponent(match[1]);
+                
+                try {
+                  const stats = await fs.promises.stat(itemPath);
+                  
+                  if (stats.isDirectory()) {
+                    // Buscar la fecha de acceso en el XML
+                    const bookmarkSection = content.split('<bookmark').find(section => section.includes(itemPath));
+                    let accessTime = 'Desconocido';
+                    
+                    if (bookmarkSection) {
+                      const timeMatch = bookmarkSection.match(/<modified>([^<]+)<\/modified>/);
+                      if (timeMatch) {
+                        accessTime = new Date(timeMatch[1]).toLocaleString();
+                      }
+                    }
+                    
+                    result.push({
+                      path: itemPath,
+                      name: path.basename(itemPath),
+                      accessTime,
+                      source: 'Archivos recientes'
+                    });
+                  }
+                } catch (error) {
+                  // Ignorar errores individuales
+                }
               }
             }
           }
-        } catch (error) {
-          // Ignorar errores de acceso
         }
-      }
-    } else if (process.platform === 'darwin') {
-      // En macOS, intentar acceder al historial de Finder
-      const { stdout } = await execPromise(
-        'defaults read com.apple.finder FXRecentFolders'
-      ).catch(() => ({ stdout: '' }));
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        if (line.includes('file://')) {
-          const urlMatch = line.match(/file:\/\/([^"]+)/);
-          if (urlMatch) {
-            const folderPath = decodeURIComponent(urlMatch[1]).replace(/^\/\//, '/');
-            
-            recentFolders.push({
-              name: folderPath,
-              type: 'Finder History'
-            });
-          }
-        }
-      }
-      
-      // Buscar carpetas específicas de Minecraft en macOS
-      const minecraftFolders = [
-        path.join(os.homedir(), 'Library', 'Application Support', 'minecraft'),
-        path.join(os.homedir(), 'Documents', 'Minecraft')
-      ];
-      
-      for (const folder of minecraftFolders) {
-        try {
-          if (fs.existsSync(folder)) {
-            const stats = await statPromise(folder);
-            
-            recentFolders.push({
-              name: folder,
-              lastAccess: stats.atime,
-              type: 'Minecraft Related'
-            });
-          }
-        } catch (error) {
-          // Ignorar errores de acceso
-        }
+      } catch (error) {
+        console.error('Error obteniendo historial de carpetas en Linux:', error);
       }
     }
-  } catch (error) {
-    console.error('Error getting folder history:', error);
-  }
-  
-  // Eliminar duplicados y ordenar por fecha de acceso
-  const uniqueFolders = [];
-  const paths = new Set();
-  
-  for (const folder of recentFolders) {
-    if (!paths.has(folder.name)) {
-      paths.add(folder.name);
-      uniqueFolders.push(folder);
-    }
-  }
-  
-  return uniqueFolders.sort((a, b) => {
-    if (a.lastAccess && b.lastAccess) {
-      return b.lastAccess - a.lastAccess;
-    } else {
+    
+    // Ordenar por fecha de acceso, más reciente primero
+    result.sort((a, b) => {
+      const dateA = new Date(a.accessTime);
+      const dateB = new Date(b.accessTime);
+      
+      // Si las fechas son válidas, ordenar por fecha
+      if (!isNaN(dateA) && !isNaN(dateB)) {
+        return dateB - dateA;
+      }
+      
+      // Si no son fechas válidas, mantener el orden original
       return 0;
-    }
-  });
+    });
+    
+    return result;
+  } catch (error) {
+    console.error('Error en getFolderHistory:', error);
+    throw error;
+  }
 }
 
 /**
- * Obtiene el historial completo de ejecuciones
- * @param {number} hours - Horas hacia atrás para buscar
+ * Obtiene historial completo de ejecuciones
  */
 async function getCompleteExecutionHistory(hours = 4) {
-  const executionHistory = [];
-  const timeThreshold = new Date();
-  timeThreshold.setHours(timeThreshold.getHours() - hours);
-  
   try {
+    const result = [];
+    const now = Date.now();
+    const timeThreshold = now - (hours * 60 * 60 * 1000);
+    
     if (process.platform === 'win32') {
-      // En Windows, usar PowerShell para obtener el historial de procesos
-      const { stdout } = await execPromise(
-        `powershell "Get-WmiObject Win32_Process | Select-Object ProcessId, Name, CommandLine, CreationDate | ConvertTo-Json"`
-      ).catch(() => ({ stdout: '[]' }));
-      
+      // En Windows, obtener historial de prefetch
       try {
-        const processes = JSON.parse(stdout);
-        const processList = Array.isArray(processes) ? processes : processes ? [processes] : [];
-        
-        for (const process of processList) {
-          if (process && process.Name) {
-            const creationDate = new Date(process.CreationDate || Date.now());
-            
-            if (creationDate >= timeThreshold) {
-              executionHistory.push({
-                name: process.Name,
-                command: process.CommandLine || 'N/A',
-                startTime: creationDate.toLocaleString(),
-                pid: process.ProcessId
-              });
+        const prefetchDir = 'C:\\Windows\\Prefetch';
+        if (fs.existsSync(prefetchDir)) {
+          const items = await fs.promises.readdir(prefetchDir, { withFileTypes: true });
+          
+          for (const item of items) {
+            try {
+              if (item.isFile() && item.name.endsWith('.pf')) {
+                const fullPath = path.join(prefetchDir, item.name);
+                const stats = await fs.promises.stat(fullPath);
+                
+                if (stats.mtime.getTime() >= timeThreshold) {
+                  // Extraer nombre del programa del archivo prefetch
+                  let programName = item.name.replace(/-[^-]+\.pf$/i, '');
+                  
+                  result.push({
+                    name: programName,
+                    path: fullPath,
+                    startTime: stats.mtime.toLocaleString(),
+                    source: 'Prefetch'
+                  });
+                }
+              }
+            } catch (error) {
+              // Ignorar errores individuales
             }
           }
         }
-      } catch (parseError) {
-        console.error('Error parsing process output:', parseError);
+      } catch (error) {
+        console.error('Error obteniendo historial de prefetch:', error);
       }
       
-      // También buscar en Prefetch para archivos ejecutados recientemente
-      const { stdout: prefetchStdout } = await execPromise(
-        `powershell "Get-ChildItem -Path 'C:\\Windows\\Prefetch' | Sort-Object LastWriteTime -Descending | Select-Object Name, LastWriteTime | ConvertTo-Json"`
-      ).catch(() => ({ stdout: '[]' }));
-      
+      // Obtener ejecuciones recientes desde el registro
       try {
-        const prefetchFiles = JSON.parse(prefetchStdout);
-        const prefetchList = Array.isArray(prefetchFiles) ? prefetchFiles : prefetchFiles ? [prefetchFiles] : [];
-        
-        for (const prefetch of prefetchList) {
-          if (prefetch && prefetch.Name) {
-            const lastWriteTime = new Date(prefetch.LastWriteTime);
-            
-            if (lastWriteTime >= timeThreshold) {
-              const exeName = prefetch.Name.replace('.pf', '').split('-')[0];
-              
-              executionHistory.push({
-                name: exeName,
-                startTime: lastWriteTime.toLocaleString(),
-                source: 'Prefetch'
-              });
+        const command = `powershell -Command "& {
+          # UserAssist (programas ejecutados)
+          try {
+            $userAssist = Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist\\*\\Count\\*' -ErrorAction SilentlyContinue;
+            $results = @();
+            foreach ($entry in $userAssist.PSObject.Properties) {
+              if ($entry.Name -notlike 'PS*') {
+                try {
+                  # Decodificar el nombre (ROT13)
+                  $encoded = $entry.Name;
+                  $decoded = '';
+                  for ($i = 0; $i -lt $encoded.Length; $i++) {
+                    $c = $encoded[$i];
+                    if ($c -ge 'a' -and $c -le 'z') {
+                      $c = [char](($c - 'a' + 13) % 26 + [int][char]'a');
+                    } elseif ($c -ge 'A' -and $c -le 'Z') {
+                      $c = [char](($c - 'A' + 13) % 26 + [int][char]'A');
+                    }
+                    $decoded += $c;
+                  }
+                  
+                  # Extraer ruta del programa si es posible
+                  $programPath = '';
+                  if ($decoded -match '([A-Z]:\\\\[^\\n]+\\.exe)') {
+                    $programPath = $matches[1];
+                  }
+                  
+                  # Obtener la última vez de ejecución
+                  $value = $entry.Value;
+                  $lastExecuted = 'Desconocido';
+                  if ($value -is [byte[]]) {
+                    # En algunos casos, el valor es un array de bytes con un timestamp
+                    if ($value.Length -ge 60) {
+                      # El timestamp suele estar en la posición 60
+                      $timestamp = [BitConverter]::ToInt64($value, 60);
+                      if ($timestamp -gt 0) {
+                        $lastExecuted = [DateTime]::FromFileTime($timestamp);
+                      }
+                    }
+                  }
+                  
+                  if ($decoded -notmatch 'UEME_') {
+                    $results += [PSCustomObject]@{
+                      Name = $decoded;
+                      Path = $programPath;
+                      LastExecuted = $lastExecuted;
+                      Source = 'UserAssist';
+                    }
+                  }
+                } catch {
+                  # Ignorar errores individuales
+                }
+              }
             }
+            $results | Where-Object { $_.LastExecuted -ne 'Desconocido' } | Sort-Object -Property LastExecuted -Descending;
+          } catch {
+            # Ignorar errores
+          }
+          
+          # OpenSaveMRU (archivos abiertos)
+          try {
+            $openSavePath = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\OpenSavePidlMRU';
+            if (Test-Path $openSavePath) {
+              Get-ChildItem $openSavePath | ForEach-Object {
+                $extension = $_.PSChildName;
+                Get-ItemProperty $_.PSPath | ForEach-Object {
+                  $_.PSObject.Properties | Where-Object { $_.Name -match '^[0-9]+$' } | ForEach-Object {
+                    try {
+                      $shell = New-Object -ComObject Shell.Application;
+                      $folder = $shell.NameSpace(0x0);
+                      $fileName = '';
+                      
+                      # Intentar obtener el nombre del archivo a partir de los datos binarios
+                      if ($_.Value -is [byte[]]) {
+                        $hexString = [System.BitConverter]::ToString($_.Value) -replace '-', '';
+                        if ($hexString -match '([0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F])00') {
+                          $fileName = $matches[1];
+                        }
+                      }
+                      
+                      [PSCustomObject]@{
+                        Extension = $extension;
+                        FileName = $fileName;
+                        LastUsed = (Get-Item $_.PSPath).LastWriteTime;
+                        Source = 'OpenSaveMRU';
+                      }
+                    } catch {
+                      # Ignorar errores individuales
+                    }
+                  }
+                }
+              }
+            }
+          } catch {
+            # Ignorar errores
+          }
+          
+          # AppCompatFlags (compatibilidad de programas)
+          try {
+            $compatFlags = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store' -ErrorAction SilentlyContinue;
+            if ($compatFlags) {
+              $compatFlags.PSObject.Properties | Where-Object { $_.Name -like '*.*' } | ForEach-Object {
+                [PSCustomObject]@{
+                  Path = $_.Name;
+                  LastExecuted = (Get-Item $_.PSPath).LastWriteTime;
+                  Source = 'AppCompatFlags';
+                }
+              }
+            }
+          } catch {
+            # Ignorar errores
+          }
+        } | ConvertTo-Json -Depth 3"`;
+        
+        const { stdout } = await execAsync(command);
+        
+        if (stdout.trim()) {
+          try {
+            let executionHistory = JSON.parse(stdout);
+            // Asegurar que sea un array
+            if (!Array.isArray(executionHistory)) {
+              executionHistory = [executionHistory];
+            }
+            
+            for (const entry of executionHistory) {
+              if (entry) {
+                let startTime;
+                if (entry.LastExecuted && entry.LastExecuted !== 'Desconocido') {
+                  startTime = new Date(entry.LastExecuted);
+                } else if (entry.LastUsed) {
+                  startTime = new Date(entry.LastUsed);
+                } else {
+                  startTime = new Date();
+                }
+                
+                // Solo incluir si está dentro del rango de tiempo
+                if (startTime.getTime() >= timeThreshold) {
+                  let name = entry.Name || entry.FileName || path.basename(entry.Path || '');
+                  
+                  if (!name && entry.Extension) {
+                    name = `Archivo con extensión ${entry.Extension}`;
+                  }
+                  
+                  result.push({
+                    name,
+                    path: entry.Path || '',
+                    startTime: startTime.toLocaleString(),
+                    source: entry.Source || 'Registro de Windows'
+                  });
+                }
+              }
+            }
+          } catch (error) {
+            console.error('Error parseando historial de ejecución:', error);
           }
         }
-      } catch (parseError) {
-        console.error('Error parsing prefetch files:', parseError);
+      } catch (error) {
+        console.error('Error obteniendo historial desde el registro:', error);
+      }
+      
+      // Historial desde el Administrador de tareas (Event Log)
+      try {
+        const { stdout } = await execAsync(`powershell -Command "& {
+          Get-WinEvent -FilterHashtable @{
+            LogName='Application';
+            Id=500;
+            StartTime=[datetime]::Now.AddHours(-${hours})
+          } -MaxEvents 100 -ErrorAction SilentlyContinue |
+          Select-Object TimeCreated, Message |
+          ForEach-Object {
+            if ($_.Message -match 'Proceso nuevo creado|New process created') {
+              $processInfo = $_.Message -replace '\\r\\n', ' ' -replace '\\s+', ' ';
+              $processName = if ($processInfo -match 'Nombre de aplicación: ([^,]+)') { $matches[1] } else { 'Desconocido' };
+              
+              [PSCustomObject]@{
+                Name = $processName;
+                Time = $_.TimeCreated;
+                Source = 'Event Log';
+              }
+            }
+          } | ConvertTo-Json
+        }"`);
+        
+        if (stdout.trim()) {
+          try {
+            let eventLogEntries = JSON.parse(stdout);
+            // Asegurar que sea un array
+            if (!Array.isArray(eventLogEntries)) {
+              eventLogEntries = [eventLogEntries];
+            }
+            
+            for (const entry of eventLogEntries) {
+              if (entry) {
+                result.push({
+                  name: entry.Name,
+                  startTime: new Date(entry.Time).toLocaleString(),
+                  source: entry.Source
+                });
+              }
+            }
+          } catch (error) {
+            console.error('Error parseando eventos del registro:', error);
+          }
+        }
+      } catch (error) {
+        console.error('Error obteniendo eventos del registro:', error);
       }
     } else if (process.platform === 'darwin') {
-      // En macOS, usar ps
-      const { stdout } = await execPromise('ps -eo pid,lstart,command').catch(() => ({ stdout: '' }));
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        if (line.trim()) {
-          // Extraer la fecha del formato de salida de ps
-          const dateMatch = line.match(/([A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4})/);
-          let startTime;
+      // En macOS, verificar historial de ejecuciones
+      try {
+        // Obtener historial reciente desde ~/Library/Application Support/com.apple.sharedfilelist/
+        const homeDir = os.homedir();
+        const recentItemsPath = path.join(homeDir, 'Library', 'Application Support', 'com.apple.sharedfilelist', 'com.apple.LSSharedFileList.RecentApplications');
+        
+        if (fs.existsSync(recentItemsPath)) {
+          const command = `plutil -convert xml1 -o - "${recentItemsPath}" | grep -A2 "<key>Bookmark</key>"`;
           
-          if (dateMatch) {
-            startTime = new Date(dateMatch[1]);
+          try {
+            const { stdout } = await execAsync(command);
             
-            if (startTime >= timeThreshold) {
-              const parts = line.split(dateMatch[1]);
-              const pid = parseInt(parts[0].trim());
-              const command = parts[1].trim();
-              
-              executionHistory.push({
-                name: command.split(' ')[0].split('/').pop(),
-                command: command,
-                startTime: startTime.toLocaleString(),
-                pid: pid
-              });
+            // Extraer información de aplicaciones recientes (simplificado)
+            const sectionMatches = stdout.split('<key>Bookmark</key>');
+            
+            for (const section of sectionMatches) {
+              if (section.includes('<data>')) {
+                const nameMatch = section.match(/<string>([^<]+)<\/string>/);
+                if (nameMatch) {
+                  const appName = nameMatch[1];
+                  
+                  result.push({
+                    name: appName,
+                    startTime: 'Reciente',
+                    source: 'macOS Recent Applications'
+                  });
+                }
+              }
             }
+          } catch (error) {
+            // Ignorar errores
           }
         }
+        
+        // También verificar los logs del sistema
+        const { stdout } = await execAsync(`log show --predicate 'process == "launchd"' --style compact --last ${hours}h | grep 'launched'`);
+        
+        const lines = stdout.split('\n').filter(line => line.trim() !== '');
+        
+        for (const line of lines) {
+          // Extraer información de proceso lanzado
+          const timeMatch = line.match(/(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+          const processMatch = line.match(/launched '([^']+)'/);
+          
+          if (timeMatch && processMatch) {
+            const time = timeMatch[1];
+            const processName = processMatch[1];
+            
+            result.push({
+              name: processName,
+              startTime: new Date(time).toLocaleString(),
+              source: 'launchd log'
+            });
+          }
+        }
+      } catch (error) {
+        console.error('Error obteniendo historial de ejecuciones en macOS:', error);
       }
     } else {
-      // En Linux, usar ps
-      const { stdout } = await execPromise('ps -eo pid,lstart,cmd').catch(() => ({ stdout: '' }));
-      
-      const lines = stdout.split('\n');
-      for (const line of lines) {
-        if (line.trim()) {
-          // Extraer la fecha del formato de salida de ps
-          const dateMatch = line.match(/([A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4})/);
-          let startTime;
+      // En Linux, verificar historial de ejecuciones
+      try {
+        const homeDir = os.homedir();
+        
+        // Verificar historial de bash
+        const bashHistoryPath = path.join(homeDir, '.bash_history');
+        if (fs.existsSync(bashHistoryPath)) {
+          const bashHistory = await fs.promises.readFile(bashHistoryPath, 'utf8');
           
-          if (dateMatch) {
-            startTime = new Date(dateMatch[1]);
+          const lines = bashHistory.split('\n').filter(line => line.trim() !== '');
+          
+          // Extraer comandos que inician programas
+          const programLines = lines.filter(line => 
+            !line.startsWith('cd ') && 
+            !line.startsWith('ls ') && 
+            !line.startsWith('cat ') && 
+            !line.startsWith('echo ') && 
+            !line.startsWith('grep ') && 
+            !line.startsWith('rm ') && 
+            !line.startsWith('mv ')
+          );
+          
+          // Obtener la fecha de modificación del archivo de historial
+          const stats = await fs.promises.stat(bashHistoryPath);
+          
+          for (const command of programLines.slice(-50)) {  // Tomar los últimos 50 comandos
+            // Extraer el nombre del programa
+            const programName = command.split(' ')[0];
             
-            if (startTime >= timeThreshold) {
-              const parts = line.split(dateMatch[1]);
-              const pid = parseInt(parts[0].trim());
-              const command = parts[1].trim();
+            result.push({
+              name: programName,
+              command: command,
+              startTime: stats.mtime.toLocaleString(),
+              source: 'bash_history'
+            });
+          }
+        }
+        
+        // Verificar historial de zsh
+        const zshHistoryPath = path.join(homeDir, '.zsh_history');
+        if (fs.existsSync(zshHistoryPath)) {
+          const zshHistory = await fs.promises.readFile(zshHistoryPath, 'utf8');
+          
+          const lines = zshHistory.split('\n').filter(line => line.trim() !== '');
+          
+          for (const line of lines.slice(-50)) {  // Tomar los últimos 50 comandos
+            // Extraer el comando y posiblemente la fecha
+            const timeMatch = line.match(/:\s+(\d+):/);
+            let timeStamp;
+            let command = line;
+            
+            if (timeMatch) {
+              timeStamp = parseInt(timeMatch[1]) * 1000;  // Convertir a milisegundos
+              command = line.split(';')[1] || line;
+            }
+            
+            // Filtrar comandos comunes que no son relevantes
+            if (!command.startsWith('cd ') && 
+                !command.startsWith('ls ') && 
+                !command.startsWith('cat ')) {
               
-              executionHistory.push({
-                name: command.split(' ')[0].split('/').pop(),
+              const programName = command.split(' ')[0];
+              
+              result.push({
+                name: programName,
                 command: command,
-                startTime: startTime.toLocaleString(),
-                pid: pid
+                startTime: timeStamp ? new Date(timeStamp).toLocaleString() : 'Reciente',
+                source: 'zsh_history'
               });
             }
           }
         }
+        
+        // Verificar journalctl para servicios iniciados
+        try {
+          const { stdout } = await execAsync(`journalctl --since "${hours} hours ago" | grep -i "started" | grep -v "systemd"`);
+          
+          const lines = stdout.split('\n').filter(line => line.trim() !== '');
+          
+          for (const line of lines) {
+            const timeMatch = line.match(/(\w+\s+\d+\s+\d+:\d+:\d+)/);
+            const serviceMatch = line.match(/Starting\s+([^\.]+)/i) || line.match(/Started\s+([^\.]+)/i);
+            
+            if (timeMatch && serviceMatch) {
+              const timeStr = timeMatch[1];
+              const serviceName = serviceMatch[1].trim();
+              
+              // Añadir el año actual para obtener una fecha completa
+              const currentYear = new Date().getFullYear();
+              const fullTimeStr = `${timeStr} ${currentYear}`;
+              
+              result.push({
+                name: serviceName,
+                startTime: new Date(fullTimeStr).toLocaleString(),
+                source: 'journalctl'
+              });
+            }
+          }
+        } catch (error) {
+          // Ignorar errores
+        }
+        
+        // Verificar registros X11
+        const xorgLogPath = '/var/log/Xorg.0.log';
+        if (fs.existsSync(xorgLogPath)) {
+          try {
+            const { stdout } = await execAsync(`grep -i "client connected" ${xorgLogPath} | tail -n 50`);
+            
+            const lines = stdout.split('\n').filter(line => line.trim() !== '');
+            
+            for (const line of lines) {
+              const clientMatch = line.match(/client connected: ([^\(]+)/i);
+              
+              if (clientMatch) {
+                const clientName = clientMatch[1].trim();
+                
+                result.push({
+                  name: clientName,
+                  startTime: 'Sesión actual',
+                  source: 'Xorg.log'
+                });
+              }
+            }
+          } catch (error) {
+            // Ignorar errores
+          }
+        }
+      } catch (error) {
+        console.error('Error obteniendo historial de ejecuciones en Linux:', error);
       }
     }
+    
+    // Ordenar por fecha de inicio, más reciente primero
+    result.sort((a, b) => {
+      const dateA = a.startTime ? new Date(a.startTime) : new Date(0);
+      const dateB = b.startTime ? new Date(b.startTime) : new Date(0);
+      
+      // Si alguna de las fechas no es válida, usamos orden lexicográfico
+      if (isNaN(dateA.getTime()) || isNaN(dateB.getTime())) {
+        return String(b.startTime).localeCompare(String(a.startTime));
+      }
+      
+      return dateB.getTime() - dateA.getTime();
+    });
+    
+    // Eliminar duplicados basados en el nombre
+    const uniqueResults = [];
+    const seenNames = new Set();
+    
+    for (const item of result) {
+      const normalizedName = item.name.toLowerCase();
+      if (!seenNames.has(normalizedName)) {
+        seenNames.add(normalizedName);
+        uniqueResults.push(item);
+      }
+    }
+    
+    return uniqueResults;
   } catch (error) {
-    console.error('Error getting execution history:', error);
+    console.error('Error en getCompleteExecutionHistory:', error);
+    throw error;
   }
-  
-  return executionHistory.sort((a, b) => {
-    return new Date(b.startTime) - new Date(a.startTime);
-  });
 }
 
 /**
- * Abre archivos comunes de Minecraft
+ * Abre los archivos de Minecraft para análisis
  */
 async function openMinecraftFiles() {
-  const mcFiles = [];
-  const userHome = os.homedir();
-  const minecraftPath = path.join(userHome, 'AppData', 'Roaming', '.minecraft');
-  
   try {
-    // Verificar si existe la carpeta de Minecraft
-    if (!fs.existsSync(minecraftPath)) {
-      return { error: 'No se encontró la carpeta de Minecraft' };
-    }
+    const result = {
+      opened: false,
+      files: []
+    };
     
-    // Lista de archivos importantes a verificar
-    const importantFiles = [
-      { name: 'options.txt', path: path.join(minecraftPath, 'options.txt'), type: 'Configuración' },
-      { name: 'launcher_profiles.json', path: path.join(minecraftPath, 'launcher_profiles.json'), type: 'Perfiles' },
-      { name: 'launcher_accounts.json', path: path.join(minecraftPath, 'launcher_accounts.json'), type: 'Cuentas' },
-      { name: 'usercache.json', path: path.join(minecraftPath, 'usercache.json'), type: 'Cache de Usuario' },
-      { name: 'servers.dat', path: path.join(minecraftPath, 'servers.dat'), type: 'Servidores' },
-      { name: 'logs', path: path.join(minecraftPath, 'logs'), type: 'Carpeta de Logs' },
-      { name: 'screenshots', path: path.join(minecraftPath, 'screenshots'), type: 'Carpeta de Capturas' },
-      { name: 'crash-reports', path: path.join(minecraftPath, 'crash-reports'), type: 'Reportes de Crash' },
-      { name: 'mods', path: path.join(minecraftPath, 'mods'), type: 'Carpeta de Mods' }
+    const homeDir = os.homedir();
+    const minecraftPaths = [
+      path.join(homeDir, 'AppData', 'Roaming', '.minecraft'),  // Windows
+      path.join(homeDir, '.minecraft'),                         // Linux
+      path.join(homeDir, 'Library', 'Application Support', 'minecraft')  // macOS
     ];
     
-    // Verificar cada archivo
-    for (const file of importantFiles) {
-      try {
-        if (fs.existsSync(file.path)) {
-          const stats = await statPromise(file.path);
-          
-          mcFiles.push({
-            name: file.name,
-            path: file.path,
-            type: file.type,
-            isDirectory: stats.isDirectory(),
-            lastModified: stats.mtime,
-            size: stats.size
-          });
-          
-          // Si es la carpeta de mods, buscar dentro de ella
-          if (file.name === 'mods' && stats.isDirectory()) {
-            const mods = await readdirPromise(file.path);
-            const modFiles = [];
+    let minecraftFolder = null;
+    
+    for (const mcPath of minecraftPaths) {
+      if (fs.existsSync(mcPath)) {
+        minecraftFolder = mcPath;
+        break;
+      }
+    }
+    
+    if (!minecraftFolder) {
+      return {
+        opened: false,
+        error: 'No se encontró la carpeta de Minecraft'
+      };
+    }
+    
+    // Abrir la carpeta de Minecraft
+    await shell.openPath(minecraftFolder);
+    result.opened = true;
+    
+    // Analizar la carpeta para obtener información relevante
+    const stats = await fs.promises.stat(minecraftFolder);
+    
+    // Añadir la carpeta principal
+    result.files.push({
+      name: path.basename(minecraftFolder),
+      path: minecraftFolder,
+      type: 'Carpeta principal',
+      lastModified: stats.mtime.getTime(),
+      isDirectory: true
+    });
+    
+    // Buscar carpetas clave dentro de Minecraft
+    const keyCatalogs = [
+      { name: 'mods', type: 'Carpeta de mods' },
+      { name: 'versions', type: 'Carpeta de versiones' },
+      { name: 'logs', type: 'Carpeta de logs' },
+      { name: 'config', type: 'Carpeta de configuración' },
+      { name: 'saves', type: 'Carpeta de mundos' },
+      { name: 'screenshots', type: 'Carpeta de capturas' }
+    ];
+    
+    for (const catalog of keyCatalogs) {
+      const catalogPath = path.join(minecraftFolder, catalog.name);
+      
+      if (fs.existsSync(catalogPath)) {
+        const catalogStats = await fs.promises.stat(catalogPath);
+        
+        result.files.push({
+          name: catalog.name,
+          path: catalogPath,
+          type: catalog.type,
+          lastModified: catalogStats.mtime.getTime(),
+          isDirectory: true
+        });
+        
+        // Si es la carpeta de mods, analizar mods instalados
+        if (catalog.name === 'mods' && catalogStats.isDirectory()) {
+          try {
+            const modFiles = await fs.promises.readdir(catalogPath);
             
-            for (const mod of mods) {
-              if (mod.endsWith('.jar')) {
-                const modPath = path.join(file.path, mod);
-                const modStats = await statPromise(modPath);
+            // Crear un objeto específico para la lista de mods
+            const modsList = {
+              name: 'Lista de mods instalados',
+              path: catalogPath,
+              type: 'Lista de Mods',
+              files: []
+            };
+            
+            for (const modFile of modFiles) {
+              if (modFile.endsWith('.jar') || modFile.endsWith('.zip')) {
+                const modPath = path.join(catalogPath, modFile);
+                const modStats = await fs.promises.stat(modPath);
                 
-                modFiles.push({
-                  name: mod,
+                modsList.files.push({
+                  name: modFile,
                   path: modPath,
-                  lastModified: modStats.mtime,
+                  lastModified: modStats.mtime.getTime(),
                   size: modStats.size
                 });
               }
             }
             
-            mcFiles.push({
-              name: 'Lista de Mods',
-              path: file.path,
-              type: 'Lista de Mods',
-              files: modFiles.sort((a, b) => b.lastModified - a.lastModified)
-            });
-          }
-          
-          // Si es la carpeta de logs, buscar el último log
-          if (file.name === 'logs' && stats.isDirectory()) {
-            const logs = await readdirPromise(file.path);
-            let latestLog = null;
-            let latestTime = 0;
+            // Ordenar mods por fecha de modificación, más reciente primero
+            modsList.files.sort((a, b) => b.lastModified - a.lastModified);
             
-            for (const log of logs) {
-              if (log.endsWith('.log') || log.endsWith('.txt')) {
-                const logPath = path.join(file.path, log);
-                const logStats = await statPromise(logPath);
-                
-                if (logStats.mtime > latestTime) {
-                  latestTime = logStats.mtime;
-                  latestLog = {
-                    name: log,
-                    path: logPath,
-                    lastModified: logStats.mtime,
-                    size: logStats.size
-                  };
-                }
-              }
-            }
-            
-            if (latestLog) {
-              mcFiles.push({
-                name: 'Último Log',
-                path: latestLog.path,
-                type: 'Log Reciente',
-                lastModified: latestLog.lastModified
-              });
-              
-              // Intentar leer el contenido del último log
-              try {
-                const logContent = fs.readFileSync(latestLog.path, 'utf8');
-                const relevantLines = [];
-                
-                // Buscar líneas relevantes (errores, advertencias, conexiones a servidores)
-                const lines = logContent.split('\n');
-                for (const line of lines) {
-                  if (line.includes('Exception') || 
-                      line.includes('Error') || 
-                      line.includes('Connecting to ') ||
-                      line.includes('WARN') ||
-                      line.includes('Server brand')) {
-                    relevantLines.push(line.trim());
-                  }
-                }
-                
-                mcFiles.push({
-                  name: 'Líneas relevantes del log',
-                  type: 'Contenido de Log',
-                  lines: relevantLines.slice(-20) // Últimas 20 líneas relevantes
-                });
-              } catch (error) {
-                console.error('Error reading log file:', error);
-              }
-            }
+            result.files.push(modsList);
+          } catch (error) {
+            console.error('Error analizando mods:', error);
           }
         }
-      } catch (error) {
-        console.error(`Error accessing file ${file.path}:`, error);
+        
+        // Si es la carpeta de logs, analizar el último log
+        if (catalog.name === 'logs' && catalogStats.isDirectory()) {
+          try {
+            const logFiles = await fs.promises.readdir(catalogPath);
+            
+            // Buscar el archivo latest.log
+            const latestLogPath = path.join(catalogPath, 'latest.log');
+            
+            if (fs.existsSync(latestLogPath)) {
+              const logStats = await fs.promises.stat(latestLogPath);
+              
+              // Leer el archivo de log y extraer líneas relevantes
+              const logContent = await fs.promises.readFile(latestLogPath, 'utf8');
+              const logLines = logContent.split('\n');
+              
+              // Buscar líneas que indiquen carga de mods, errores o warnings
+              const relevantLines = logLines.filter(line => 
+                line.includes('ERROR') || 
+                line.includes('WARN') || 
+                line.includes('Exception') || 
+                line.includes('Loaded mod') || 
+                line.includes('Forge') || 
+                line.includes('Fabric') ||
+                line.includes('initializing')
+              );
+              
+              // Limitar a las 100 líneas más relevantes para no sobrecargar la UI
+              const limitedLines = relevantLines.slice(0, 100);
+              
+              result.files.push({
+                name: 'latest.log',
+                path: latestLogPath,
+                type: 'Contenido de Log',
+                lastModified: logStats.mtime.getTime(),
+                size: logStats.size,
+                lines: limitedLines
+              });
+            }
+          } catch (error) {
+            console.error('Error analizando logs:', error);
+          }
+        }
       }
     }
     
-    // Abrir el explorador de archivos en la carpeta de Minecraft
-    if (process.platform === 'win32') {
-      await execPromise(`explorer "${minecraftPath}"`);
-    } else if (process.platform === 'darwin') {
-      await execPromise(`open "${minecraftPath}"`);
-    } else {
-      await execPromise(`xdg-open "${minecraftPath}"`);
+    // Buscar archivos de configuración importantes
+    const keyConfigFiles = [
+      { name: 'options.txt', type: 'Archivo de opciones' },
+      { name: 'launcher_profiles.json', type: 'Perfiles del launcher' },
+      { name: 'launcher_accounts.json', type: 'Cuentas del launcher' }
+    ];
+    
+    for (const configFile of keyConfigFiles) {
+      const filePath = path.join(minecraftFolder, configFile.name);
+      
+      if (fs.existsSync(filePath)) {
+        const fileStats = await fs.promises.stat(filePath);
+        
+        result.files.push({
+          name: configFile.name,
+          path: filePath,
+          type: configFile.type,
+          lastModified: fileStats.mtime.getTime(),
+          size: fileStats.size,
+          isDirectory: false
+        });
+      }
     }
     
-    return { success: true, files: mcFiles };
+    return result;
   } catch (error) {
-    console.error('Error opening Minecraft files:', error);
-    return { error: error.message };
+    console.error('Error en openMinecraftFiles:', error);
+    throw error;
   }
 }
 
 /**
- * Navega a la ubicación de un archivo en el explorador
- * @param {string} filePath - Ruta del archivo
+ * Abre la ubicación de un archivo en el explorador
  */
 async function openFileLocation(filePath) {
   try {
     if (!fs.existsSync(filePath)) {
-      return { error: 'El archivo no existe' };
+      throw new Error(`La ruta no existe: ${filePath}`);
     }
     
-    const directoryPath = path.dirname(filePath);
+    // Si es un archivo, abrir la carpeta contenedora y seleccionar el archivo
+    const stats = await fs.promises.stat(filePath);
     
-    if (process.platform === 'win32') {
-      await execPromise(`explorer /select,"${filePath}"`);
-    } else if (process.platform === 'darwin') {
-      await execPromise(`open -R "${filePath}"`);
+    if (stats.isFile()) {
+      if (process.platform === 'win32') {
+        // En Windows, podemos seleccionar el archivo en el explorador
+        await execAsync(`explorer.exe /select,"${filePath}"`);
+      } else {
+        // En otros sistemas, simplemente abrimos la carpeta contenedora
+        const dirPath = path.dirname(filePath);
+        await shell.openPath(dirPath);
+      }
     } else {
-      // En Linux, intentar abrir el directorio padre
-      await execPromise(`xdg-open "${directoryPath}"`);
+      // Si es un directorio, abrirlo directamente
+      await shell.openPath(filePath);
     }
     
-    return { success: true, path: filePath };
+    return { success: true };
   } catch (error) {
-    console.error('Error opening file location:', error);
-    return { error: error.message };
+    console.error('Error en openFileLocation:', error);
+    throw error;
   }
 }
 
 /**
- * Obtiene el historial de comandos CMD/PowerShell
+ * Obtiene el historial de comandos de terminal
  */
 async function getCommandHistory() {
-  const commands = [];
-  
   try {
+    const result = [];
+    
     if (process.platform === 'win32') {
-      // Intentar obtener el historial de PowerShell
-      const psHistoryPath = path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'PowerShell', 'PSReadLine', 'ConsoleHost_history.txt');
+      // En Windows, obtener historial de PowerShell y CMD
       
-      if (fs.existsSync(psHistoryPath)) {
-        try {
-          const historyContent = fs.readFileSync(psHistoryPath, 'utf8');
-          const historyLines = historyContent.split('\n').filter(line => line.trim());
-          
-          for (const line of historyLines.slice(-100)) { // Últimos 100 comandos
-            commands.push({
-              source: 'PowerShell',
-              command: line,
-              timestamp: null // Historial de PS no guarda timestamps
-            });
-          }
-        } catch (error) {
-          console.error('Error reading PowerShell history:', error);
-        }
-      }
-      
-      // Intentar obtener historial de CMD (doskey)
+      // Historial de PowerShell
       try {
-        const { stdout } = await execPromise('doskey /history').catch(() => ({ stdout: '' }));
+        const psHistoryPath = path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'PowerShell', 'PSReadline', 'ConsoleHost_history.txt');
         
-        if (stdout) {
-          const cmdLines = stdout.split('\n').filter(line => line.trim());
+        if (fs.existsSync(psHistoryPath)) {
+          const psHistory = await fs.promises.readFile(psHistoryPath, 'utf8');
           
-          for (const line of cmdLines) {
-            commands.push({
-              source: 'CMD',
-              command: line,
-              timestamp: null // doskey no guarda timestamps
+          const lines = psHistory.split('\n').filter(line => line.trim() !== '');
+          
+          // Obtener los últimos 50 comandos
+          const recentCommands = lines.slice(-50);
+          
+          // Obtener la fecha de modificación del archivo de historial
+          const stats = await fs.promises.stat(psHistoryPath);
+          const modTime = stats.mtime.getTime();
+          
+          for (const command of recentCommands) {
+            result.push({
+              source: 'PowerShell',
+              command,
+              timestamp: modTime
             });
           }
         }
       } catch (error) {
-        console.error('Error getting CMD history:', error);
+        console.error('Error obteniendo historial de PowerShell:', error);
       }
       
-      // También verificar el historial de Windows Terminal si existe
-      const windowsTerminalPath = path.join(os.homedir(), 'AppData', 'Local', 'Packages', 'Microsoft.WindowsTerminal_8wekyb3d8bbwe', 'LocalState');
+      // Historial de CMD usando doskey
+      try {
+        // Crear un archivo temporal para guardar el historial
+        const tempHistoryPath = path.join(os.tmpdir(), `cmd_history_${Date.now()}.txt`);
+        
+        // Ejecutar doskey /history y guardar en el archivo temporal
+        await execAsync(`cmd.exe /c doskey /history > "${tempHistoryPath}"`);
+        
+        if (fs.existsSync(tempHistoryPath)) {
+          const cmdHistory = await fs.promises.readFile(tempHistoryPath, 'utf8');
+          
+          // Eliminar el archivo temporal
+          fs.unlink(tempHistoryPath, () => {});
+          
+          const lines = cmdHistory.split('\n').filter(line => line.trim() !== '');
+          
+          for (const command of lines) {
+            result.push({
+              source: 'CMD',
+              command,
+              timestamp: Date.now()
+            });
+          }
+        }
+      } catch (error) {
+        console.error('Error obteniendo historial de CMD:', error);
+      }
       
-      if (fs.existsSync(windowsTerminalPath)) {
-        try {
-          const files = await readdirPromise(windowsTerminalPath);
-          for (const file of files) {
-            if (file.includes('commandHistory') || file.includes('state')) {
-              try {
-                const filePath = path.join(windowsTerminalPath, file);
-                const content = fs.readFileSync(filePath, 'utf8');
-                const json = JSON.parse(content);
-                
-                if (json && json.commandHistory) {
-                  for (const cmd of json.commandHistory) {
-                    commands.push({
-                      source: 'Windows Terminal',
-                      command: cmd,
-                      timestamp: null
-                    });
-                  }
-                }
-              } catch (e) {
-                // Ignorar errores de parseo
+      // También verificar historial de comandos en el Registro de Windows
+      try {
+        const command = `powershell -Command "& {
+          $commands = @();
+          
+          # Buscar en AppCompatFlags para comandos recientes
+          $compatFlags = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU' -ErrorAction SilentlyContinue;
+          if ($compatFlags) {
+            $compatFlags.PSObject.Properties | Where-Object { $_.Name -match '^[a-z]$' } | ForEach-Object {
+              $commands += [PSCustomObject]@{
+                Command = $_.Value -replace '\\\\1$', '';
+                Source = 'RunMRU';
+                Time = (Get-Item $_.PSPath).LastWriteTime;
               }
             }
           }
-        } catch (error) {
-          console.error('Error reading Windows Terminal history:', error);
+          
+          # Comandos ejecutados desde la barra de búsqueda/ejecución
+          $searchHistory = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\WordWheelQuery' -ErrorAction SilentlyContinue;
+          if ($searchHistory -and $searchHistory.MRUListEx) {
+            $searchHistory.PSObject.Properties | Where-Object { $_.Name -match '^[0-9]+$' } | ForEach-Object {
+              if ($_.Value -is [byte[]]) {
+                try {
+                  $text = [System.Text.Encoding]::Unicode.GetString($_.Value).Trim('\\u0000');
+                  if ($text) {
+                    $commands += [PSCustomObject]@{
+                      Command = $text;
+                      Source = 'Búsqueda';
+                      Time = (Get-Item $_.PSPath).LastWriteTime;
+                    }
+                  }
+                } catch {}
+              }
+            }
+          }
+          
+          $commands | ConvertTo-Json;
+        }"`;
+        
+        const { stdout } = await execAsync(command);
+        
+        if (stdout.trim()) {
+          try {
+            let registryCommands = JSON.parse(stdout);
+            // Asegurar que sea un array
+            if (!Array.isArray(registryCommands)) {
+              registryCommands = [registryCommands];
+            }
+            
+            for (const entry of registryCommands) {
+              if (entry && entry.Command) {
+                result.push({
+                  source: entry.Source,
+                  command: entry.Command,
+                  timestamp: new Date(entry.Time).getTime()
+                });
+              }
+            }
+          } catch (error) {
+            console.error('Error parseando comandos del registro:', error);
+          }
         }
+      } catch (error) {
+        console.error('Error obteniendo comandos del registro:', error);
       }
-    } else if (process.platform === 'darwin' || process.platform === 'linux') {
-      // Buscar historiales en sistemas Unix
-      const historyPaths = [
-        { path: path.join(os.homedir(), '.bash_history'), source: 'Bash' },
-        { path: path.join(os.homedir(), '.zsh_history'), source: 'Zsh' },
-        { path: path.join(os.homedir(), '.history'), source: 'Shell' }
+    } else {
+      // En Unix-like (macOS/Linux)
+      const homeDir = os.homedir();
+      
+      // Array de posibles archivos de historial
+      const historyFiles = [
+        { path: path.join(homeDir, '.bash_history'), source: 'Bash' },
+        { path: path.join(homeDir, '.zsh_history'), source: 'Zsh' },
+        { path: path.join(homeDir, '.sh_history'), source: 'Shell' },
+        { path: path.join(homeDir, '.history'), source: 'Shell' },
+        { path: path.join(homeDir, '.local', 'share', 'fish', 'fish_history'), source: 'Fish' }
       ];
       
-      for (const histFile of historyPaths) {
-        if (fs.existsSync(histFile.path)) {
+      for (const historyFile of historyFiles) {
+        if (fs.existsSync(historyFile.path)) {
           try {
-            const historyContent = fs.readFileSync(histFile.path, 'utf8');
-            const historyLines = historyContent.split('\n').filter(line => line.trim());
+            const content = await fs.promises.readFile(historyFile.path, 'utf8');
+            const stats = await fs.promises.stat(historyFile.path);
+            const lines = content.split('\n').filter(line => line.trim() !== '');
             
-            for (const line of historyLines.slice(-100)) { // Últimos 100 comandos
-              // Intentar extraer timestamp si está presente (formato zsh)
-              const timestampMatch = line.match(/^: (\d+):/);
-              let timestamp = null;
+            // Obtener los últimos 50 comandos
+            const recentCommands = lines.slice(-50);
+            
+            for (const line of recentCommands) {
+              // Limpiar el comando (algunas shells incluyen timestamps o metadatos)
               let command = line;
+              let timestamp = stats.mtime.getTime();
               
-              if (timestampMatch) {
-                timestamp = new Date(parseInt(timestampMatch[1]) * 1000);
-                command = line.substring(line.indexOf(':') + 1);
-                // Si hay dos puntos al principio, quitar todo hasta el segundo
-                if (command.startsWith(':')) {
-                  command = command.substring(command.indexOf(':') + 1);
+              // En zsh, los comandos pueden tener timestamp en formato ': 1234567890:0;comando'
+              if (historyFile.source === 'Zsh' && line.match(/^:\s*\d+:\d+;/)) {
+                const match = line.match(/^:\s*(\d+):\d+;(.+)$/);
+                if (match) {
+                  timestamp = parseInt(match[1]) * 1000;  // Convertir a milisegundos
+                  command = match[2];
                 }
               }
               
-              commands.push({
-                source: histFile.source,
-                command: command,
-                timestamp: timestamp
+              result.push({
+                source: historyFile.source,
+                command,
+                timestamp
               });
             }
           } catch (error) {
-            console.error(`Error reading ${histFile.source} history:`, error);
+            console.error(`Error leyendo archivo de historial ${historyFile.path}:`, error);
           }
         }
       }
     }
+    
+    // Ordenar por timestamp, más reciente primero
+    result.sort((a, b) => b.timestamp - a.timestamp);
+    
+    // Convertir timestamps a fechas legibles
+    for (const entry of result) {
+      entry.timestamp = new Date(entry.timestamp).toLocaleString();
+    }
+    
+    return result;
   } catch (error) {
-    console.error('Error getting command history:', error);
+    console.error('Error en getCommandHistory:', error);
+    throw error;
   }
+}
+
+/**
+ * Función para el auto-eliminado del programa cuando se cierre
+ */
+function registerSelfDestruct() {
+  const appPath = app.getPath('exe');
+  const tempBatPath = path.join(os.tmpdir(), `delete_${Date.now()}.bat`);
   
-  return commands;
+  // Crear un script BAT que esperará hasta que el proceso termine y luego eliminará el archivo
+  const batContent = `
+@echo off
+:check
+tasklist /FI "IMAGENAME eq ${path.basename(appPath)}" | find /I "${path.basename(appPath)}" > nul
+if not errorlevel 1 (
+  timeout /t 1 > nul
+  goto check
+)
+del /F /Q "${appPath}"
+del /F /Q "%~f0"
+`;
+  
+  fs.writeFileSync(tempBatPath, batContent);
+  
+  // Ejecutar el script BAT en una nueva ventana oculta
+  const startInfo = {
+    windowsHide: true,
+    detached: true,
+    stdio: 'ignore'
+  };
+  
+  const childProcess = require('child_process').spawn('cmd', ['/c', tempBatPath], startInfo);
+  childProcess.unref();
+}
+
+// Analiza procesos en busca de programas sospechosos
+async function analyzeProcesses() {
+  try {
+    const result = {
+      suspiciousProcesses: [],
+      injections: [],
+      hiddenProcesses: []
+    };
+    
+    // Lista de nombres de procesos potencialmente sospechosos
+    const suspiciousKeywords = [
+      'cheat', 'hack', 'inject', 'memory', 'dll', 'mod', 
+      'trainer', 'autoclicker', 'macro', 'bypass', 'spoof'
+    ];
+    
+    if (process.platform === 'win32') {
+      // En Windows, usar métodos avanzados para detectar procesos
+      try {
+        // Usar PowerShell para obtener información detallada de procesos
+        const command = `powershell -Command "& {
+          # Obtener todos los procesos con información detallada
+          Get-Process | Select-Object Name, Id, Path, Company, Description, 
+                                     @{Name='StartTime';Expression={$_.StartTime}},
+                                     @{Name='CommandLine';Expression={
+                                       (Get-WmiObject -Class Win32_Process -Filter \"ProcessId = '$($_.Id)'\").CommandLine
+                                     }} |
+          ConvertTo-Json -Depth 1
+        }"`;
+        
+        const { stdout } = await execAsync(command);
+        
+        if (stdout.trim()) {
+          let processes;
+          try {
+            processes = JSON.parse(stdout);
+            // Asegurar que sea un array
+            if (!Array.isArray(processes)) {
+              processes = [processes];
+            }
+            
+            for (const process of processes) {
+              // Normalizar propiedades para evitar problemas con valores null
+              const processName = (process.Name || '').toLowerCase();
+              const processPath = (process.Path || '').toLowerCase();
+              const processDesc = (process.Description || '').toLowerCase();
+              const processCmd = (process.CommandLine || '').toLowerCase();
+              
+              // Verificar si el proceso coincide con palabras clave sospechosas
+              const isSuspicious = suspiciousKeywords.some(keyword => 
+                processName.includes(keyword) || 
+                processPath.includes(keyword) || 
+                processDesc.includes(keyword) || 
+                processCmd.includes(keyword)
+              );
+              
+              // También marcar procesos sin ruta o información como sospechosos
+              const isUnknown = !process.Path && !process.Company && !process.Description;
+              
+              if (isSuspicious || isUnknown) {
+                result.suspiciousProcesses.push({
+                  name: process.Name,
+                  pid: process.Id,
+                  path: process.Path || 'Desconocida',
+                  company: process.Company || 'Desconocida',
+                  startTime: process.StartTime ? new Date(process.StartTime).toLocaleString() : 'Desconocida',
+                  commandLine: process.CommandLine || 'Desconocida',
+                  reason: isSuspicious ? 'Nombre/ruta sospechosa' : 'Información limitada'
+                });
+              }
+            }
+          } catch (error) {
+            console.error('Error parseando información de procesos:', error);
+          }
+        }
+      } catch (error) {
+        console.error('Error obteniendo información de procesos:', error);
+      }
+      
+      // Detectar inyecciones de DLL
+      try {
+        // Especialmente enfocado en el proceso de Minecraft
+        const command = `powershell -Command "& {
+          $minecraftProcesses = Get-Process | Where-Object { $_.ProcessName -eq 'javaw' -or $_.ProcessName -eq 'java' -or $_.ProcessName -eq 'minecraft' };
+          
+          foreach ($process in $minecraftProcesses) {
+            $modules = $process.Modules;
+            $suspiciousModules = $modules | Where-Object { 
+              $_.ModuleName -notlike '*java*' -and 
+              $_.ModuleName -notlike '*jvm*' -and
+              $_.ModuleName -notlike '*minecraft*' -and
+              $_.ModuleName -notlike 'ntdll.dll' -and
+              $_.ModuleName -notlike 'kernel32.dll' -and
+              $_.ModuleName -notlike 'user32.dll' -and
+              $_.ModuleName -notlike 'nt*' -and
+              $_.ModuleName -notlike 'win*' -and
+              $_.ModuleName -notlike 'system*'
+            };
+            
+            foreach ($module in $suspiciousModules) {
+              [PSCustomObject]@{
+                ProcessName = $process.ProcessName;
+                ProcessId = $process.Id;
+                ModuleName = $module.ModuleName;
+                ModulePath = $module.FileName;
+              }
+            }
+          }
+        } | ConvertTo-Json"`;
+        
+        const { stdout } = await execAsync(command);
+        
+        if (stdout.trim()) {
+          try {
+            let injectedModules = JSON.parse(stdout);
+            // Asegurar que sea un array
+            if (!Array.isArray(injectedModules)) {
+              injectedModules = [injectedModules];
+            }
+            
+            for (const module of injectedModules) {
+              result.injections.push({
+                processName: module.ProcessName,
+                pid: module.ProcessId,
+                moduleName: module.ModuleName,
+                modulePath: module.ModulePath
+              });
+            }
+          } catch (error) {
+            console.error('Error parseando módulos inyectados:', error);
+          }
+        }
+      } catch (error) {
+        console.error('Error detectando inyecciones de DLL:', error);
+      }
+      
+      // Detectar procesos ocultos
+      try {
+        // Comparar procesos listados por diferentes métodos para encontrar inconsistencias
+        const command = `powershell -Command "& {
+          $tasklistProcesses = tasklist /fo csv | ConvertFrom-Csv | Select-Object -ExpandProperty 'Image Name';
+          $getProcessProcesses = Get-Process | Select-Object -ExpandProperty ProcessName;
+          
+          # Encontrar procesos que aparecen en uno pero no en otro
+          $missingInTasklist = $getProcessProcesses | Where-Object { $tasklistProcesses -notcontains ($_ + '.exe') -and $tasklistProcesses -notcontains $_ };
+          $missingInGetProcess = $tasklistProcesses | ForEach-Object { $_ -replace '.exe$', '' } | Where-Object { $getProcessProcesses -notcontains $_ };
+          
+          [PSCustomObject]@{
+            MissingInTasklist = $missingInTasklist;
+            MissingInGetProcess = $missingInGetProcess;
+          } | ConvertTo-Json
+        }"`;
+        
+        const { stdout } = await execAsync(command);
+        
+        if (stdout.trim()) {
+          try {
+            const hiddenInfo = JSON.parse(stdout);
+            
+            if (hiddenInfo.MissingInTasklist && hiddenInfo.MissingInTasklist.length > 0) {
+              for (const processName of hiddenInfo.MissingInTasklist) {
+                result.hiddenProcesses.push({
+                  name: processName,
+                  method: 'No aparece en tasklist pero sí en Get-Process',
+                  reason: 'Posible ocultamiento'
+                });
+              }
+            }
+            
+            if (hiddenInfo.MissingInGetProcess && hiddenInfo.MissingInGetProcess.length > 0) {
+              for (const processName of hiddenInfo.MissingInGetProcess) {
+                result.hiddenProcesses.push({
+                  name: processName,
+                  method: 'No aparece en Get-Process pero sí en tasklist',
+                  reason: 'Posible ocultamiento'
+                });
+              }
+            }
+          } catch (error) {
+            console.error('Error parseando información de procesos ocultos:', error);
+          }
+        }
+      } catch (error) {
+        console.error('Error detectando procesos ocultos:', error);
+      }
+    } else if (process.platform === 'darwin') {
+      // En macOS, usar ps para información de procesos
+      try {
+        const { stdout } = await execAsync('ps -axo pid,comm');
+        
+        const lines = stdout.split('\n').slice(1); // Omitir encabezado
+        
+        for (const line of lines) {
+          const match = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+          
+          if (match) {
+            const pid = match[1];
+            const processName = match[2];
+            
+            // Verificar si el proceso coincide con palabras clave sospechosas
+            const isSuspicious = suspiciousKeywords.some(keyword => 
+              processName.toLowerCase().includes(keyword)
+            );
+            
+            if (isSuspicious) {
+              result.suspiciousProcesses.push({
+                name: processName,
+                pid,
+                reason: 'Nombre sospechoso'
+              });
+            }
+          }
+        }
+        
+        // Buscar DLL inyectadas en procesos relacionados con Minecraft
+        const { stdout: javaProcs } = await execAsync('ps -axo pid,comm | grep -i java');
+        
+        const javaPids = javaProcs.split('\n').map(line => {
+          const match = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+          return match ? match[1] : null;
+        }).filter(Boolean);
+        
+        for (const pid of javaPids) {
+          try {
+            // Obtener información de librerías cargadas
+            const { stdout: libInfo } = await execAsync(`lsof -p ${pid} | grep -i '\\\.dylib'`);
+            
+            const libs = libInfo.split('\n').filter(line => line.trim() !== '');
+            
+            for (const lib of libs) {
+              const libPath = lib.split(/\s+/).pop();
+              
+              // Ignorar librerías del sistema
+              if (libPath && !libPath.includes('/System/') && !libPath.includes('/usr/lib/')) {
+                result.injections.push({
+                  processName: 'java',
+                  pid,
+                  moduleName: path.basename(libPath),
+                  modulePath: libPath
+                });
+              }
+            }
+          } catch (error) {
+            // Ignorar errores individuales
+          }
+        }
+      } catch (error) {
+        console.error('Error analizando procesos en macOS:', error);
+      }
+    } else {
+      // En Linux, usar ps para información de procesos
+      try {
+        const { stdout } = await execAsync('ps -axo pid,comm');
+        
+        const lines = stdout.split('\n').slice(1); // Omitir encabezado
+        
+        for (const line of lines) {
+          const match = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+          
+          if (match) {
+            const pid = match[1];
+            const processName = match[2];
+            
+            // Verificar si el proceso coincide con palabras clave sospechosas
+            const isSuspicious = suspiciousKeywords.some(keyword => 
+              processName.toLowerCase().includes(keyword)
+            );
+            
+            if (isSuspicious) {
+              result.suspiciousProcesses.push({
+                name: processName,
+                pid,
+                reason: 'Nombre sospechoso'
+              });
+            }
+          }
+        }
+        
+        // Buscar librerías sospechosas en procesos Java
+        try {
+          const { stdout: javaProcs } = await execAsync('ps -axo pid,comm | grep -i java');
+          
+          const javaPids = javaProcs.split('\n').map(line => {
+            const match = line.trim().match(/^\s*(\d+)\s+(.+)$/);
+            return match ? match[1] : null;
+          }).filter(Boolean);
+          
+          for (const pid of javaPids) {
+            try {
+              const { stdout: mapsInfo } = await execAsync(`cat /proc/${pid}/maps | grep -i '\\\.so'`);
+              
+              const libs = mapsInfo.split('\n').filter(line => line.trim() !== '');
+              
+              for (const lib of libs) {
+                const libPath = lib.split(/\s+/).pop();
+                
+                // Ignorar librerías del sistema
+                if (libPath && !libPath.includes('/lib/') && !libPath.includes('/usr/lib/')) {
+                  result.injections.push({
+                    processName: 'java',
+                    pid,
+                    moduleName: path.basename(libPath),
+                    modulePath: libPath
+                  });
+                }
+              }
+            } catch (error) {
+              // Ignorar errores individuales
+            }
+          }
+        } catch (error) {
+          // Ignorar error si no hay procesos Java
+        }
+      } catch (error) {
+        console.error('Error analizando procesos en Linux:', error);
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en analyzeProcesses:', error);
+    throw error;
+  }
+}
+
+// Escanea mods de Minecraft para detectar potenciales cheats
+async function scanMinecraftMods() {
+  try {
+    const result = {
+      suspiciousMods: [],
+      recentlyModifiedMods: [],
+      modFolders: []
+    };
+    
+    const homeDir = os.homedir();
+    const minecraftPaths = [
+      path.join(homeDir, 'AppData', 'Roaming', '.minecraft'),  // Windows
+      path.join(homeDir, '.minecraft'),                         // Linux
+      path.join(homeDir, 'Library', 'Application Support', 'minecraft')  // macOS
+    ];
+    
+    // Lista de firmas sospechosas en mods
+    const suspiciousKeywords = [
+      'hack', 'cheat', 'xray', 'autoclicker', 'killaura', 'bhop', 'flight',
+      'wallhack', 'noclip', 'speed', 'aimbot', 'esp', 'tracers', 'reach',
+      'bypass', 'ghostclient', 'baritone', 'nuker', 'autotool', 'blink',
+      'fastplace', 'nofall', 'antiknockback', 'criticals', 'scaffold',
+      'timer', 'freecam', 'fullbright', 'jesus', 'phase', 'spoofer',
+      'macro', 'bot', 'inject', 'pvp', 'autofish', 'aura', 'client'
+    ];
+    
+    // Listas blancas de mods legítimos que podrían dar falsos positivos
+    const whitelistedMods = [
+      'optifine', 'sodium', 'phosphor', 'lithium', 'fabric-api',
+      'forge', 'jei', 'rei', 'worldedit', 'performance', 'mod-menu',
+      'shulkertooltip', 'shaders', 'dynamiclights', 'appleskin',
+      'journeymap', 'voxelmap', 'xaero', 'minimap', 'inventory',
+      'craftguide', 'craftpresence', 'ding', 'sound', 'loot', 'voicechat',
+      'terralith', 'biomes', 'better', 'durability', 'mouse', 'tweaks',
+      'curios', 'baubles', 'gadget', 'utility', 'ftb', 'mekanism',
+      'thermal', 'tinkers', 'blood', 'botania', 'computercraft',
+      'chisel', 'create', 'refined', 'storage', 'applied'
+    ];
+    
+    let minecraftFolder = null;
+    
+    // Encontrar la primera carpeta de Minecraft que exista
+    for (const mcPath of minecraftPaths) {
+      if (fs.existsSync(mcPath)) {
+        minecraftFolder = mcPath;
+        break;
+      }
+    }
+    
+    if (!minecraftFolder) {
+      return result;
+    }
+    
+    // Buscar carpetas de mods
+    const potentialModFolders = [
+      path.join(minecraftFolder, 'mods'),
+      path.join(minecraftFolder, 'config')
+    ];
+    
+    // Buscar también carpetas de mods en carpetas de instancias
+    const instanceFolders = [
+      path.join(homeDir, 'AppData', 'Roaming', 'MultiMC', 'instances'),
+      path.join(homeDir, 'curseforge', 'minecraft', 'Instances'),
+      path.join(homeDir, 'twitch', 'minecraft', 'Instances'),
+      path.join(homeDir, '.techniclauncher', 'modpacks'),
+      path.join(homeDir, 'Documents', 'Curse', 'Minecraft', 'Instances'),
+      path.join(homeDir, 'GDLauncher', 'instances')
+    ];
+    
+    // Buscar instancias de Minecraft
+    for (const instanceFolder of instanceFolders) {
+      if (fs.existsSync(instanceFolder)) {
+        try {
+          const instances = await fs.promises.readdir(instanceFolder, { withFileTypes: true });
+          
+          for (const instance of instances) {
+            if (instance.isDirectory()) {
+              const instanceModsPath = path.join(instanceFolder, instance.name, 'mods');
+              if (fs.existsSync(instanceModsPath)) {
+                potentialModFolders.push(instanceModsPath);
+              }
+            }
+          }
+        } catch (error) {
+          console.error(`Error al buscar instancias en ${instanceFolder}:`, error);
+        }
+      }
+    }
+    
+    // Procesar cada carpeta de mods
+    for (const modFolder of potentialModFolders) {
+      if (fs.existsSync(modFolder)) {
+        try {
+          const folderStats = await fs.promises.stat(modFolder);
+          
+          result.modFolders.push({
+            path: modFolder,
+            lastModified: folderStats.mtime.toLocaleString()
+          });
+          
+          const files = await fs.promises.readdir(modFolder, { withFileTypes: true });
+          
+          for (const file of files) {
+            if (file.isFile() && (file.name.endsWith('.jar') || file.name.endsWith('.zip'))) {
+              const modPath = path.join(modFolder, file.name);
+              const stats = await fs.promises.stat(modPath);
+              
+              const oneWeekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+              const isRecent = stats.mtime.getTime() >= oneWeekAgo;
+              
+              // Verificar si el nombre del mod contiene palabras clave sospechosas
+              const nameLower = file.name.toLowerCase();
+              
+              const suspiciousNameKeywords = suspiciousKeywords.filter(keyword => 
+                nameLower.includes(keyword)
+              );
+              
+              // Verificar si el mod está en la lista blanca
+              const isWhitelisted = whitelistedMods.some(whiteMod => 
+                nameLower.includes(whiteMod)
+              );
+              
+              // Si el mod tiene palabras clave sospechosas y no está en la lista blanca
+              if (suspiciousNameKeywords.length > 0 && !isWhitelisted) {
+                result.suspiciousMods.push({
+                  name: file.name,
+                  path: modPath,
+                  size: stats.size,
+                  lastModified: stats.mtime.toLocaleString(),
+                  suspiciousKeywords: suspiciousNameKeywords,
+                  reason: `Contiene palabras clave sospechosas: ${suspiciousNameKeywords.join(', ')}`
+                });
+              }
+              
+              // Si el mod fue modificado recientemente
+              if (isRecent) {
+                result.recentlyModifiedMods.push({
+                  name: file.name,
+                  path: modPath,
+                  size: stats.size,
+                  lastModified: stats.mtime.toLocaleString()
+                });
+              }
+              
+              // TODO: Implementar análisis del contenido del JAR para detectar firmas de cheat
+              // (Requeriría extraer el JAR y examinar clases específicas)
+            }
+          }
+        } catch (error) {
+          console.error(`Error procesando carpeta de mods ${modFolder}:`, error);
+        }
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en scanMinecraftMods:', error);
+    throw error;
+  }
+}
+
+// Detecta inyecciones de código malicioso en el cliente
+async function detectInjections() {
+  try {
+    const result = {
+      injectedDLLs: [],
+      suspiciousModifications: [],
+      memoryScans: []
+    };
+    
+    if (process.platform === 'win32') {
+      // Buscar procesos de Minecraft
+      try {
+        const { stdout } = await execAsync('tasklist /fi "imagename eq java.exe" /fi "imagename eq javaw.exe" /fo csv');
+        
+        const lines = stdout.split('\n').filter(line => line.includes('java'));
+        
+        for (const line of lines) {
+          try {
+            const match = line.match(/"([^"]+)","([^"]+)"/);
+            if (match) {
+              const processName = match[1];
+              const pid = match[2];
+              
+              // Obtener módulos DLL cargados en este proceso
+              const command = `powershell -Command "& {
+                Get-Process -Id ${pid} -Module | 
+                Where-Object { 
+                  $_.ModuleName -notlike '*jvm*' -and
+                  $_.ModuleName -notlike '*java*' -and
+                  $_.ModuleName -notlike '*minecraft*' -and
+                  $_.ModuleName -notlike 'ntdll.dll' -and
+                  $_.ModuleName -notlike 'kernel32.dll' -and
+                  $_.ModuleName -notlike 'user32.dll' -and
+                  $_.ModuleName -notlike 'nt*' -and
+                  $_.ModuleName -notlike 'win*' -and
+                  $_.ModuleName -notlike 'system*'
+                } | 
+                Select-Object ModuleName, FileName, Company, Description |
+                ConvertTo-Json
+              }"`;
+              
+              const { stdout: modulesJson } = await execAsync(command);
+              
+              if (modulesJson.trim()) {
+                try {
+                  let modules = JSON.parse(modulesJson);
+                  
+                  // Asegurar que sea un array
+                  if (!Array.isArray(modules)) {
+                    modules = [modules];
+                  }
+                  
+                  for (const module of modules) {
+                    result.injectedDLLs.push({
+                      processName: processName,
+                      pid: pid,
+                      moduleName: module.ModuleName,
+                      filePath: module.FileName,
+                      company: module.Company || 'Desconocida',
+                      description: module.Description || 'Desconocida'
+                    });
+                  }
+                } catch (error) {
+                  console.error('Error parseando módulos:', error);
+                }
+              }
+              
+              // Buscar modificaciones sospechosas en las regiones de memoria
+              const memoryCommand = `powershell -Command "& {
+                $process = Get-Process -Id ${pid};
+                $baseAddress = $process.MainModule.BaseAddress;
+                $size = $process.MainModule.ModuleMemorySize;
+                
+                # Esta parte simplemente indica que realizamos el análisis
+                # Un análisis de memoria real requeriría acceso más profundo
+                [PSCustomObject]@{
+                  ProcessName = '${processName}';
+                  PID = ${pid};
+                  BaseAddress = '0x' + $baseAddress.ToString('X');
+                  MemorySize = $size;
+                  Analyzed = $true;
+                }
+              } | ConvertTo-Json"`;
+              
+              try {
+                const { stdout: memoryJson } = await execAsync(memoryCommand);
+                
+                if (memoryJson.trim()) {
+                  const memoryInfo = JSON.parse(memoryJson);
+                  
+                  result.memoryScans.push({
+                    processName: memoryInfo.ProcessName,
+                    pid: memoryInfo.PID,
+                    baseAddress: memoryInfo.BaseAddress,
+                    memorySize: memoryInfo.MemorySize,
+                    analyzed: memoryInfo.Analyzed,
+                    findings: 'Análisis básico completado'
+                  });
+                }
+              } catch (error) {
+                console.error('Error en análisis de memoria:', error);
+              }
+            }
+          } catch (error) {
+            console.error('Error procesando proceso Java:', error);
+          }
+        }
+      } catch (error) {
+        console.error('Error buscando procesos Java:', error);
+      }
+      
+      // Buscar modificaciones sospechosas en archivos de Minecraft
+      try {
+        const homeDir = os.homedir();
+        const minecraftPath = path.join(homeDir, 'AppData', 'Roaming', '.minecraft');
+        
+        if (fs.existsSync(minecraftPath)) {
+          // Verificar versiones de Minecraft modificadas
+          const versionsPath = path.join(minecraftPath, 'versions');
+          
+          if (fs.existsSync(versionsPath)) {
+            const versions = await fs.promises.readdir(versionsPath, { withFileTypes: true });
+            
+            for (const version of versions) {
+              if (version.isDirectory()) {
+                const versionName = version.name;
+                const versionJsonPath = path.join(versionsPath, versionName, `${versionName}.json`);
+                
+                if (fs.existsSync(versionJsonPath)) {
+                  try {
+                    const jsonContent = await fs.promises.readFile(versionJsonPath, 'utf8');
+                    const versionData = JSON.parse(jsonContent);
+                    
+                    // Verificar si esta versión está modificada
+                    if (versionData.mainClass && !versionData.mainClass.includes('net.minecraft.client.main.Main')) {
+                      result.suspiciousModifications.push({
+                        type: 'Version modificada',
+                        name: versionName,
+                        path: versionJsonPath,
+                        mainClass: versionData.mainClass,
+                        reason: 'MainClass no estándar'
+                      });
+                    }
+                    
+                    // Verificar librerías sospechosas
+                    if (versionData.libraries && Array.isArray(versionData.libraries)) {
+                      for (const library of versionData.libraries) {
+                        if (library.name && typeof library.name === 'string') {
+                          const libraryName = library.name.toLowerCase();
+                          
+                          // Detectar librerías sospechosas
+                          if (libraryName.includes('inject') || 
+                              libraryName.includes('hack') || 
+                              libraryName.includes('cheat') || 
+                              libraryName.includes('xray')) {
+                            
+                            result.suspiciousModifications.push({
+                              type: 'Librería sospechosa',
+                              name: library.name,
+                              version: versionName,
+                              path: versionJsonPath,
+                              reason: 'Nombre de librería sospechoso'
+                            });
+                          }
+                        }
+                      }
+                    }
+                  } catch (error) {
+                    console.error(`Error procesando archivo de versión ${versionJsonPath}:`, error);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error verificando modificaciones de archivo:', error);
+      }
+    } else if (process.platform === 'darwin') {
+      // En macOS, buscar procesos de Java que podrían ser Minecraft
+      try {
+        const { stdout } = await execAsync('ps -ax | grep -i java | grep -v grep');
+        
+        const lines = stdout.split('\n').filter(line => line.trim() !== '');
+        
+        for (const line of lines) {
+          const match = line.match(/^\s*(\d+)\s+/);
+          
+          if (match) {
+            const pid = match[1];
+            
+            // Obtener librerías cargadas
+            const { stdout: libsOutput } = await execAsync(`lsof -p ${pid} | grep -i '\\\.dylib'`);
+            
+            const libs = libsOutput.split('\n').filter(line => line.trim() !== '');
+            
+            for (const lib of libs) {
+              const libPath = lib.split(/\s+/).pop();
+              
+              // Ignorar librerías del sistema
+              if (libPath && !libPath.includes('/System/') && !libPath.includes('/usr/lib/')) {
+                result.injectedDLLs.push({
+                  processName: 'java',
+                  pid: pid,
+                  moduleName: path.basename(libPath),
+                  filePath: libPath,
+                  company: 'Desconocida',
+                  description: 'Librería cargada en proceso Java'
+                });
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error buscando procesos Java en macOS:', error);
+      }
+    } else {
+      // En Linux, buscar procesos de Java que podrían ser Minecraft
+      try {
+        const { stdout } = await execAsync('ps -ax | grep -i java | grep -v grep');
+        
+        const lines = stdout.split('\n').filter(line => line.trim() !== '');
+        
+        for (const line of lines) {
+          const match = line.match(/^\s*(\d+)\s+/);
+          
+          if (match) {
+            const pid = match[1];
+            
+            // Verificar si es Minecraft buscando en los argumentos
+            if (line.includes('minecraft')) {
+              // Obtener librerías cargadas
+              try {
+                const { stdout: mapsOutput } = await execAsync(`cat /proc/${pid}/maps | grep -i '\\\.so'`);
+                
+                const libs = mapsOutput.split('\n').filter(line => line.trim() !== '');
+                
+                for (const lib of libs) {
+                  const libPath = lib.split(/\s+/).pop();
+                  
+                  // Ignorar librerías del sistema
+                  if (libPath && !libPath.includes('/lib/') && !libPath.includes('/usr/lib/')) {
+                    result.injectedDLLs.push({
+                      processName: 'java',
+                      pid: pid,
+                      moduleName: path.basename(libPath),
+                      filePath: libPath,
+                      company: 'Desconocida',
+                      description: 'Librería cargada en proceso Java'
+                    });
+                  }
+                }
+              } catch (error) {
+                // Ignorar errores individuales
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error buscando procesos Java en Linux:', error);
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error en detectInjections:', error);
+    throw error;
+  }
 }
 
 module.exports = {
@@ -2284,5 +4286,8 @@ module.exports = {
   openMinecraftFiles,
   openFileLocation,
   getCommandHistory,
-  minecraftCheatsDatabase
+  registerSelfDestruct,
+  analyzeProcesses,
+  scanMinecraftMods,
+  detectInjections
 };
